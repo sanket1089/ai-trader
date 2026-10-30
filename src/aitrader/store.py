@@ -421,6 +421,13 @@ class Store:
         rows = self._read("SELECT equity FROM equity WHERE book = ? AND day = ?", (book, _day(d).isoformat()))
         return rows[0]["equity"] if rows else None
 
+    def latest_equity_snapshot_before(self, book: str, d: date) -> float | None:
+        """Equity of the most recent snapshot dated strictly before ``d``, or ``None`` if there is none."""
+        # days are stored as ISO strings (YYYY-MM-DD), which sort chronologically
+        rows = self._read("SELECT equity FROM equity WHERE book = ? AND day < ? ORDER BY day DESC LIMIT 1",
+                          (book, _day(d).isoformat()))
+        return rows[0]["equity"] if rows else None
+
     # ---- counters (days are IST calendar days) ----
 
     def entries_on(self, book: str, d: date) -> int:

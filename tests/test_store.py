@@ -369,6 +369,41 @@ def test_equity_snapshot_rejects_datetime_instead_of_date(store):
         store.equity_snapshot("learning", at(MON, "15:30"))
 
 
+def test_latest_equity_snapshot_before_is_the_most_recent_strictly_earlier_day(store):
+    assert store.latest_equity_snapshot_before("learning", WED) is None
+    store.save_equity_snapshot("learning", date(2026, 10, 28), 100300.0)
+    store.save_equity_snapshot("learning", MON, 100000.0)
+    store.save_equity_snapshot("learning", WED, 99000.0)
+    store.save_equity_snapshot("learning", date(2026, 11, 9), 98000.0)
+    assert store.latest_equity_snapshot_before("learning", WED) == 100000.0       # TUE has none: MON
+    assert store.latest_equity_snapshot_before("learning", TUE) == 100000.0
+    assert store.latest_equity_snapshot_before("learning", MON) == 100300.0       # same day excluded
+    assert store.latest_equity_snapshot_before("learning", date(2026, 10, 28)) is None
+    assert store.latest_equity_snapshot_before("learning", date(2026, 12, 1)) == 98000.0
+
+
+def test_latest_equity_snapshot_before_orders_by_date_across_month_and_year_ends(store):
+    store.save_equity_snapshot("learning", date(2026, 9, 30), 1.0)
+    store.save_equity_snapshot("learning", date(2026, 10, 2), 2.0)
+    store.save_equity_snapshot("learning", date(2026, 12, 31), 3.0)
+    assert store.latest_equity_snapshot_before("learning", date(2026, 10, 3)) == 2.0
+    assert store.latest_equity_snapshot_before("learning", date(2026, 10, 1)) == 1.0
+    assert store.latest_equity_snapshot_before("learning", date(2027, 1, 4)) == 3.0
+
+
+def test_latest_equity_snapshot_before_is_per_book(store):
+    store.save_equity_snapshot("learning", MON, 100000.0)
+    assert store.latest_equity_snapshot_before("realistic", TUE) is None
+    store.save_equity_snapshot("realistic", date(2026, 10, 30), 1000.0)
+    assert store.latest_equity_snapshot_before("realistic", TUE) == 1000.0
+    assert store.latest_equity_snapshot_before("learning", TUE) == 100000.0
+
+
+def test_latest_equity_snapshot_before_rejects_datetime_instead_of_date(store):
+    with pytest.raises(TypeError):
+        store.latest_equity_snapshot_before("learning", at(MON, "15:30"))
+
+
 # ---- counters ----
 
 def test_entries_on_ignores_exits(store):

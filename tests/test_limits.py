@@ -454,7 +454,66 @@ def test_books_are_independent(store):
 
 
 def test_holidays_iterable_is_copied_at_construction(store):
+    holiday = date(2026, 11, 6)                          # Friday
+    monday = date(2026, 11, 9)
+    store.save_equity_snapshot(BOOK, date(2026, 11, 5), 1000.0)    # Thursday: the reference if Friday is a holiday
+    store.save_equity_snapshot(BOOK, holiday, 850.0)               # the reference if Friday is NOT a holiday
+    ll = LossLimits(store, REALISTIC, (d for d in [holiday]))      # a one-shot generator
+    first = ll.evaluate(950.0, at(monday, "12:00"))
+    second = ll.evaluate(950.0, at(monday, "12:05"))               # the generator would be exhausted by now
+    assert first.daily_loss == pytest.approx(50.0)                 # 1000 - 950, not 850 - 950
+    assert second.daily_loss == pytest.approx(50.0)
+    assert ll.state(at(monday, "12:10")) is LimitState.ACTIVE
+
+
+# ---------------------------------------------------------------- limits: daily reference fallback
+
+
+def test_a_missing_previous_close_does_not_hide_a_real_daily_loss(store):
+    # true prior close 1300 is missing, so the latest earlier snapshot (1300 on the Wednesday
+    # before) is the reference; falling back to the 1000 baseline would read 1150 as a gain
+    store.save_equity_snapshot(BOOK, date(2026, 10, 28), 1300.0)
+    ll = LossLimits(store, REALISTIC, [])
+    ev = ll.evaluate(1150.0, NOON_MON)
+    assert ev.daily_loss == pytest.approx(150.0)
+    assert ev.total_loss == pytest.approx(-150.0)
+    assert ev.state is LimitState.DAILY_PAUSED
+    assert ev.newly_triggered is True
+
+
+def test_the_latest_earlier_snapshot_wins_over_older_ones(store):
+    store.save_equity_snapshot(BOOK, date(2026, 10, 27), 1500.0)
+    store.save_equity_snapshot(BOOK, date(2026, 10, 28), 1100.0)
+    ll = LossLimits(store, REALISTIC, [])
+    assert ll.evaluate(1050.0, NOON_MON).daily_loss == pytest.approx(50.0)
+
+
+def test_the_previous_trading_days_snapshot_is_still_the_reference_when_it_exists(store):
+    store.save_equity_snapshot(BOOK, date(2026, 10, 28), 1300.0)
     store.save_equity_snapshot(BOOK, FRI, 1000.0)
-    ll = LossLimits(store, REALISTIC, (d for d in [date(2026, 12, 25)]))          # a one-shot generator
-    ll.evaluate(1000.0, NOON_MON)
-    ll.evaluate(1000.0, NOON_TUE)                                                 # would break if consumed
+    ll = LossLimits(store, REALISTIC, [])
+    ev = ll.evaluate(950.0, NOON_MON)
+    assert ev.daily_loss == pytest.approx(50.0)
+    assert ev.state is LimitState.ACTIVE
+
+
+def test_the_baseline_is_the_reference_only_when_no_earlier_snapshot_exists(store):
+    ll = LossLimits(store, REALISTIC, [])
+    assert ll.evaluate(920.0, NOON_MON).daily_loss == pytest.approx(80.0)        # no snapshots at all
+
+
+def test_a_same_day_or_later_snapshot_is_never_the_reference(store):
+    store.save_equity_snapshot(BOOK, MON, 1300.0)
+    store.save_equity_snapshot(BOOK, TUE, 1300.0)
+    ll = LossLimits(store, REALISTIC, [])
+    ev = ll.evaluate(920.0, NOON_MON)
+    assert ev.daily_loss == pytest.approx(80.0)          # baseline 1000, not 1300
+    assert ev.state is LimitState.ACTIVE
+
+
+def test_a_missing_previous_close_is_logged(store, caplog):
+    store.save_equity_snapshot(BOOK, date(2026, 10, 28), 1300.0)
+    ll = LossLimits(store, REALISTIC, [])
+    with caplog.at_level(logging.WARNING, logger="aitrader.risk.limits"):
+        ll.evaluate(1300.0, NOON_MON)
+    assert any("snapshot" in r.getMessage() and r.levelno == logging.WARNING for r in caplog.records)

@@ -6,7 +6,8 @@ States, in order of precedence:
   (starting capital, or the equity at the last approved recovery reset). Latched in the store
   until ``reset_baseline``; recovering equity does not lift it.
 * ``DAILY_PAUSED``: the loss since the previous trading day's closing snapshot reached the daily
-  limit. Latched for that IST calendar day only.
+  limit (if that snapshot is missing, since the latest earlier one; with none, since the
+  baseline). Latched for that IST calendar day only.
 * ``ACTIVE``.
 
 Everything that matters is persisted, so a restart sees the same state and ``newly_triggered``
@@ -101,6 +102,24 @@ class LossLimits:
         """Current state from persisted data only. Needs no equity and writes nothing."""
         return self._persisted_state(_ist_day(now))
 
+    def _daily_reference(self, today: date, baseline: float) -> float:
+        """Equity the daily loss is measured from.
+
+        The previous trading day's closing snapshot. If that one is missing (the service was
+        down, a postmarket job failed) the latest snapshot dated before today is used instead,
+        so a real loss is never hidden by falling back to an old baseline. Only a book with no
+        earlier snapshot at all (its first day) is measured from the baseline.
+        """
+        previous = self._store.equity_snapshot(self._book, previous_trading_day(today, self._holidays))
+        if previous is not None:
+            return previous
+        earlier = self._store.latest_equity_snapshot_before(self._book, today)
+        if earlier is not None:
+            log.warning("no equity snapshot for the previous trading day on %s; measuring the daily "
+                        "loss of %s from the latest earlier snapshot (%.2f)", self._book, today, earlier)
+            return earlier
+        return baseline
+
     def evaluate(self, equity: float, now: datetime) -> LimitEval:
         """Apply ``equity`` at ``now``, persist any transition and report the resulting state.
 
@@ -121,9 +140,7 @@ class LossLimits:
             before = self._persisted_state(today)
 
             base = self.baseline()
-            previous_close = self._store.equity_snapshot(
-                self._book, previous_trading_day(today, self._holidays))
-            daily_ref = base if previous_close is None else previous_close
+            daily_ref = self._daily_reference(today, base)
             daily_loss = daily_ref - equity
             total_loss = base - equity
 
