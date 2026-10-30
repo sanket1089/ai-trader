@@ -1,0 +1,119 @@
+# All non-secret settings. Secrets (ANTHROPIC_API_KEY, TELEGRAM_BOT_TOKEN,
+# TELEGRAM_OWNER_CHAT_ID) live only in .env, never here.
+#
+# Conventions: every *_pct value is in percent (0.5 means 0.5%); money is INR
+# unless a key says usd; times are IST wall-clock "HH:MM" and must be quoted
+# (YAML would read an unquoted 10:20 as the integer 620).
+
+db_path: data/aitrader.db
+
+books:
+  - name: realistic
+    capital: 1000
+    daily_loss_limit: 100
+    total_loss_limit: 500
+    max_entries_per_day: 1
+    max_sell_days_per_week: 3
+    max_position_pct: 100
+  - name: learning
+    capital: 100000
+    daily_loss_limit: 10000
+    total_loss_limit: 50000
+    max_entries_per_day: 3
+    max_sell_days_per_week: null   # no weekly sell-day cap
+    max_position_pct: 20
+
+# Delivery (CNC) charges. All *_pct are percent of turnover (qty x price).
+charges:
+  brokerage_per_order: 0.0   # INR per order, configurable
+  stt_pct: 0.1               # on buy and on sell
+  stamp_buy_pct: 0.015       # buy side only
+  exchange_pct: 0.00322
+  sebi_pct: 0.0001
+  gst_pct: 18.0              # on (brokerage + exchange + SEBI)
+  dp_per_sell: 15.34         # INR flat per sell
+
+risk:
+  entry_band_pct: 0.5        # entry limit within +/-0.5% of last price
+  exit_band_pct: 1.0         # exit limit 1% through the last price (marketable)
+  cost_multiple: 3.0         # expected move x position value >= 3x round-trip charges
+  data_delay_minutes: 15     # free quote feed delay
+  stale_extra_minutes: 10    # stale if older than delay + this
+  entry_start: "09:20"
+  entry_end: "15:10"
+  exit_start: "09:15"
+  max_orders_per_sec: 1
+  exit_check_minutes: 3
+  exit_reprice_minutes: 2
+  exit_max_reprices: 3
+
+approval:
+  expiry_minutes: 10         # card also expires at risk.entry_end
+  reprice_tolerance_pct: 0.5 # re-issue the card if price moved more than this
+
+ai:
+  monthly_budget_usd: 100
+  usd_inr: 88
+  reduced_at_pct: 80         # at/above: effort forced to low, intraday re-runs at most every 2h
+  # Models are never switched automatically; change them here.
+  agents:
+    news:              {model: claude-opus-5-5, effort: low}
+    technical:         {model: claude-opus-5-5, effort: low}
+    fundamental:       {model: claude-opus-5-5, effort: low}
+    portfolio_manager: {model: claude-opus-5-5, effort: medium}
+    reviewer:          {model: claude-opus-5-5, effort: medium}
+  # USD per million tokens.
+  prices:
+    claude-opus-5-5:   {input: 4, output: 20, cache_read: 0.20, cache_write: 5}
+    claude-sonnet-5-5: {input: 2, output: 10, cache_read: 0.20, cache_write: 2.5}
+    claude-haiku-4-5:  {input: 1, output: 5, cache_read: 0.10, cache_write: 1.25}
+
+data:
+  etfs: [NIFTYBEES, GOLDBEES, LIQUIDBEES, BANKBEES]
+  nifty100_csv_url: https://nsearchives.nseindia.com/content/indices/ind_nifty100list.csv
+  rss_feeds:
+    - https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms
+    # NOTE: this feed responds (HTTP 200) but its newest items were dated April 2024
+    # when checked on 2026-10-30, so it may add no fresh news. Kept as specified.
+    - https://www.moneycontrol.com/rss/marketreports.xml
+    - https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml
+  shortlist_size: 25
+
+schedule:
+  premarket: "08:30"
+  open_session: "09:20"
+  intraday: ["10:20", "11:20", "12:20", "13:20", "14:20"]
+  postmarket: "15:45"
+  weekly_day: Saturday
+  weekly_time: "10:00"
+
+# NSE trading holidays, capital market (CM) segment.
+# Source: https://www.nseindia.com/api/holiday-master?type=trading (the data behind
+# https://www.nseindia.com/resources/exchange-communication-holidays), checked 2026-10-30.
+# Weekend entries are kept exactly as NSE lists them (harmless: weekends are never trading days).
+holidays:
+  # 2026
+  - 2026-01-15   # Municipal Corporation Election - Maharashtra
+  - 2026-01-26   # Republic Day
+  - 2026-02-15   # Mahashivratri (Sunday)
+  - 2026-03-03   # Holi
+  - 2026-03-21   # Id-Ul-Fitr (Saturday)
+  - 2026-03-26   # Shri Ram Navami
+  - 2026-03-31   # Shri Mahavir Jayanti
+  - 2026-04-03   # Good Friday
+  - 2026-04-14   # Dr. Baba Saheb Ambedkar Jayanti
+  - 2026-05-01   # Maharashtra Day
+  - 2026-05-28   # Bakri Id
+  - 2026-06-26   # Muharram
+  - 2026-08-15   # Independence Day (Saturday)
+  - 2026-09-14   # Ganesh Chaturthi
+  - 2026-10-02   # Mahatma Gandhi Jayanti
+  - 2026-10-20   # Dussehra
+  - 2026-11-08   # Diwali Laxmi Pujan (Sunday; NSE marks it * for a special Muhurat trading session, not modelled)
+  - 2026-11-10   # Diwali-Balipratipada
+  - 2026-11-24   # Prakash Gurpurb Sri Guru Nanak Dev
+  - 2026-12-25   # Christmas
+  # 2027
+  # TODO: verify 2027 holidays at https://www.nseindia.com/resources/exchange-communication-holidays
+  # NSE had not published a 2027 list on 2026-10-30 (the holiday API returned no 2027 rows),
+  # so none are listed. Until they are added, 2027 weekday holidays would be treated as trading days.
