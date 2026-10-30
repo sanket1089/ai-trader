@@ -11,7 +11,7 @@ from exec_fakes import FakeBroker, FakeNotifier, FakeRisk, FakeTime
 from aitrader.broker import PaperBroker
 from aitrader.calendar import at
 from aitrader.config import ChargesConfig
-from aitrader.execution import Executor
+from aitrader.execution import Executor, marketable_limit
 from aitrader.models import Order, OrderStatus, Position, Quote, Side, TradeIdea
 from aitrader.store import Store
 
@@ -224,6 +224,25 @@ async def test_submit_with_the_real_paper_broker_updates_cash_and_position(store
     assert [(p.symbol, p.qty, p.stop, p.target) for p in store.positions(BOOK)] == [(SYMBOL, 3, 270.0, 300.0)]
     assert store.cash(BOOK) < 1000.0
     assert f"₹{fill.price:.2f}" in notifier.texts[0] and f"₹{fill.charges:.2f}" in notifier.texts[0]
+
+
+# ---------------------------------------------------------------- marketable_limit
+
+
+@pytest.mark.parametrize("price, buy, sell", [(280.0, 281.40, 278.60), (284.0, 285.42, 282.58),
+                                              (401.13, 403.13, 399.13), (10.01, 10.06, 9.96)])
+def test_marketable_limit_is_the_edge_of_the_band_to_the_paisa(price, buy, sell):
+    assert marketable_limit(Side.BUY, price, 0.5) == buy        # floored: never outside the band
+    assert marketable_limit(Side.SELL, price, 0.5) == sell      # ceiled: never outside the band
+
+
+@pytest.mark.parametrize("price", [1.0, 9.99, 99.99, 280.0, 401.13, 1234.57, 2999.95])
+def test_marketable_limit_fills_at_the_paper_broker_inside_the_risk_band(price):
+    # A limit equal to the last price never fills (the broker adds 0.30% slippage), and one more than
+    # 0.5% away is refused by the risk gate: the marketable limit must satisfy both.
+    buy, sell = marketable_limit(Side.BUY, price, 0.5), marketable_limit(Side.SELL, price, 0.5)
+    assert round(price * 1.003, 2) <= buy <= price * 1.005 + 1e-6
+    assert round(price * 0.997, 2) >= sell >= price * 0.995 - 1e-6
 
 
 # ---------------------------------------------------------------- submit_exit / reprice_exit

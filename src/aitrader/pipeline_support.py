@@ -30,7 +30,7 @@ from aitrader.agents.schemas import FundamentalView, NewsDigest, RecoveryPlan, T
 from aitrader.approvals import get_autopilot, set_autopilot
 from aitrader.calendar import IST
 from aitrader.data.market_data import is_stale
-from aitrader.execution import describe_error
+from aitrader.execution import describe_error, marketable_limit
 from aitrader.models import Order, Quote, Side, TradeIdea
 from aitrader.risk.equity import book_equity
 from aitrader.risk.limits import LimitEval, LimitState
@@ -291,16 +291,19 @@ def reanchor(svc: Any, idea: TradeIdea, quote: Quote) -> TradeIdea | None:
     """The idea re-priced at the fresh quote, saved under the same id, or ``None`` to skip it.
 
     Premarket limits are set against the previous close and may be outside the entry band by the
-    time the idea is acted on. BUY: limit = the quote (to the paisa), stop and target kept, and
-    ``stop < limit < target`` must still hold; ``expected_move_pct`` is capped at the new
-    limit-to-target distance. SELL: limit = the quote, only for a symbol some book holds. The
-    adjusted idea is persisted so the card, the risk cost rule and the review all see one version.
+    time the idea is acted on. The new limit is a marketable one (``marketable_limit``): the edge of
+    the entry band, because the paper broker adds slippage to the quote and a limit equal to the
+    quote would never fill. BUY: stop and target kept, ``stop < limit < target`` must still hold, and
+    ``expected_move_pct`` is capped at the new limit-to-target distance. SELL: only for a symbol some
+    book holds. The adjusted idea is persisted so the card, the sizing, the risk cost rule and the
+    review all see one version.
     """
-    limit = round(quote.price, 2)
+    band = svc.settings.risk.entry_band_pct
     if idea.side is Side.BUY:
+        limit = marketable_limit(Side.BUY, quote.price, band)
         if not idea.stop < limit < idea.target:
-            log.info("%s: price already beyond stop/target at open (price %.2f, stop %.2f, target %.2f); "
-                     "idea skipped", idea.symbol, limit, idea.stop, idea.target)
+            log.info("%s: price already beyond stop/target at open (price %.2f, limit %.2f, stop %.2f, "
+                     "target %.2f); idea skipped", idea.symbol, quote.price, limit, idea.stop, idea.target)
             return None
         move = min(idea.expected_move_pct, (idea.target - limit) / limit * 100)
         adjusted = replace(idea, limit_price=limit, expected_move_pct=move)
@@ -308,7 +311,7 @@ def reanchor(svc: Any, idea: TradeIdea, quote: Quote) -> TradeIdea | None:
         if idea.symbol not in held_symbols(svc):
             log.info("%s: SELL idea skipped, the symbol is not held", idea.symbol)
             return None
-        adjusted = replace(idea, limit_price=limit)
+        adjusted = replace(idea, limit_price=marketable_limit(Side.SELL, quote.price, band))
     else:
         return None
     if adjusted != idea:

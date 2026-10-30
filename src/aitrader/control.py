@@ -33,7 +33,7 @@ from typing import Any
 from aitrader.agents.llm import BudgetLevel, budget_level
 from aitrader.approvals import Resolution, get_autopilot, set_autopilot
 from aitrader.calendar import IST
-from aitrader.execution import describe_error
+from aitrader.execution import describe_error, marketable_limit
 from aitrader.models import Order, OrderStatus, Quote
 from aitrader.risk.equity import book_equity
 from aitrader.risk.limits import LimitState
@@ -477,11 +477,16 @@ async def handle_card_tap(card_id: str, approve: bool, svc: Any, now: datetime) 
 
 async def _place_orders(svc: Any, card: Any, idea: Any, quote: Quote | None, now: datetime) -> str:
     lines = [f"Approved {idea.side} {idea.symbol}."]
+    # The limit is re-set at the price of this moment: the idea's was set when the card was issued, the
+    # price has moved since (up to the re-issue tolerance), and a stale limit is either refused by the
+    # risk gate's band or too low to fill once the paper broker adds its slippage.
+    limit = (marketable_limit(idea.side, quote.price, svc.settings.risk.entry_band_pct)
+             if quote is not None else idea.limit_price)
     for book, qty in card.sizes.items():
         if qty <= 0:
             continue
         order = Order(id=uuid.uuid4().hex, book=book, symbol=idea.symbol, side=idea.side, qty=qty,
-                      limit_price=idea.limit_price, reason=idea.reason, is_exit=False, idea_id=idea.id,
+                      limit_price=limit, reason=idea.reason, is_exit=False, idea_id=idea.id,
                       created_at=now)
         try:
             fill = await svc.executor.submit(order, quote, now, idea)

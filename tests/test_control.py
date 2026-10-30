@@ -510,6 +510,29 @@ async def test_card_approve_submits_per_book(svc):
     assert len(svc.notifier.texts) == 2                                      # the executor announced each fill
 
 
+async def test_card_approve_fills_when_the_price_dipped_after_the_card(svc):
+    """Regression: the order used the card-time limit (281.0). After a dip of 0.36% (inside the re-issue
+    tolerance) that is more than 0.5% above the price and the risk gate refused it."""
+    card = new_card(svc)
+    svc.market_data.set(SYMBOL, 279.0, NOW - timedelta(minutes=1))
+
+    reply = await handle_card(card.id, True, svc, NOW)
+
+    assert "realistic: filled 3 @ ₹279.84" in reply and "learning: filled 71 @ ₹279.84" in reply, reply
+    assert svc.store.pending_orders() == []
+
+
+async def test_card_approve_fills_when_the_price_rose_after_the_card(svc):
+    """The card-time limit (281.0) is below 281.4 = 280.5 x 1.003 of a +0.18% rise: it never filled."""
+    card = new_card(svc)
+    svc.market_data.set(SYMBOL, 280.5, NOW - timedelta(minutes=1))
+
+    reply = await handle_card(card.id, True, svc, NOW)
+
+    assert "realistic: filled 3 @ ₹281.34" in reply, reply
+    assert svc.store.pending_orders() == []
+
+
 async def test_card_approve_builds_orders_from_the_stored_idea(svc):
     svc.executor = spy = SpyExecutor()
     card = new_card(svc)
@@ -518,7 +541,9 @@ async def test_card_approve_builds_orders_from_the_stored_idea(svc):
 
     assert [c[0].book for c in spy.calls] == [REAL, LEARN]
     for o, quote, now, idea in spy.calls:
-        assert (len(o.id), o.symbol, o.side, o.limit_price) == (32, SYMBOL, Side.BUY, 281.0)
+        # the idea's own limit (281.0) is not used: the order is limited at the top of the entry band of
+        # the fresh quote of 280.0
+        assert (len(o.id), o.symbol, o.side, o.limit_price) == (32, SYMBOL, Side.BUY, 281.4)
         assert (o.reason, o.is_exit, o.idea_id, o.created_at) == ("trend is up", False, "i1", NOW)
         assert o.status is OrderStatus.PENDING
         assert quote == Quote(SYMBOL, 280.0, NOW - timedelta(minutes=1))   # a fresh quote from market data

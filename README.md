@@ -66,6 +66,16 @@ py -3 -m venv .venv
    ```
    .venv\Scripts\python -m aitrader run --dry-run
    ```
+   To see just one morning without starting the bot, run the simulator. It does the 08:30 premarket and
+   the 09:20 open session **once** with real data and the real Claude API, places no orders and sends
+   nothing to Telegram, and prints the news digest, the shortlist, the AI's ideas with their reasons, the
+   approval cards you would have received, and what the run cost in AI spend (about US$1-3, so it needs
+   `ANTHROPIC_API_KEY` in `.env`; without it the script says so and stops):
+   ```
+   .venv\Scripts\python scripts\simulate_day.py
+   ```
+   Cards appear only while quotes are fresh: run it on a trading day between about 09:30 and 15:10 IST.
+   It uses its own database, `data/simulate.db` (recreated on every run), never the real one.
 3. Then run it for real (paper trading):
    ```
    .venv\Scripts\python -m aitrader run

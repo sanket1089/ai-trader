@@ -23,12 +23,14 @@ Rules every method follows:
 
 import asyncio
 import logging
+import math
 import os
 import time
 import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import date, datetime
+from fractions import Fraction
 from typing import Protocol
 
 from aitrader.approvals import ApprovalCard
@@ -66,6 +68,21 @@ def describe_error(exc: BaseException) -> str:
         return type(exc).__name__
     last = frames[-1]
     return f"{type(exc).__name__} at {os.path.basename(last.filename)}:{last.lineno} in {last.name}"
+
+
+def marketable_limit(side: Side, price: float, band_pct: float) -> float:
+    """The limit for a discretionary order (an entry, or a SELL that is not a stop/target exit) that
+    can actually fill, to the paisa: the edge of the risk gate's ``band_pct`` band around ``price``.
+
+    The paper broker fills a BUY at the price plus its slippage (a SELL at the price minus it) and only
+    if that is within the limit, so a limit equal to the last price never fills; the risk gate refuses a
+    limit more than ``band_pct`` from the last price. A BUY gets the top of the band (floored to the
+    paisa), a SELL the bottom (ceiled), so the result is never outside the band. Mirrors the 1% through
+    the price that ``exits.exit_limit`` uses for exits. Exact fraction arithmetic keeps float noise
+    from moving it a paisa.
+    """
+    exact = Fraction(price) * (1 + Fraction(str(band_pct)) / 100 * (1 if side == Side.BUY else -1)) * 100
+    return (math.floor(exact) if side == Side.BUY else math.ceil(exact)) / 100
 
 
 def _ist_day(now: datetime) -> date:

@@ -193,16 +193,47 @@ async def test_open_session_reanchors_buy_limit_to_fresh_quote(tmp_path):
     await pipeline.open_session(svc, now)
 
     stored = svc.store.get_idea("i1")
-    assert stored.limit_price == 284.0 and stored.stop == 266.0 and stored.target == 300.0
-    assert stored.expected_move_pct == pytest.approx((300.0 - 284.0) / 284.0 * 100)
+    # a marketable limit: the top of the 0.5% entry band (the paper broker adds slippage to the quote)
+    assert stored.limit_price == 285.42 and stored.stop == 266.0 and stored.target == 300.0
+    assert stored.expected_move_pct == pytest.approx((300.0 - 285.42) / 285.42 * 100)
     card, text = svc.notifier.cards[0]
-    assert "₹284.00" in text
+    assert "₹285.42" in text
     quote = svc.market_data.quote("NIFTYBEES")
     order = Order(id="o", book=LEARN, symbol="NIFTYBEES", side=Side.BUY, qty=card.sizes[LEARN],
                   limit_price=stored.limit_price, reason="r", is_exit=False, idea_id="i1", created_at=now)
     decision = svc.risk.check(order, quote, now, stored)
     assert not any("outside" in r for r in decision.reasons), decision.reasons
     assert decision.approved, decision.reasons
+
+
+async def test_open_session_autopilot_entries_actually_fill_at_the_paper_broker(tmp_path):
+    """Regression: the limit used to be the quote itself, below the quote plus the broker's slippage,
+    so a real (not spied) entry order was placed and then never filled."""
+    now = at(MON, "09:20")
+    svc = make_svc(tmp_path, md_at(now), now=now, spy=False)
+    set_autopilot(svc.store, True)
+    stage_ideas(svc, [nifty_idea()])
+    await pipeline.open_session(svc, now)
+    assert svc.store.pending_orders() == []
+    for book in (REAL, LEARN):
+        (position,) = svc.store.positions(book)
+        assert position.symbol == "NIFTYBEES" and position.qty > 0
+        (fill,) = svc.store.fills(book, at(MON, "00:00"), at(MON, "23:59"))
+        assert fill.price == round(280.0 * 1.003, 2)
+
+
+async def test_open_session_autopilot_sell_idea_actually_fills_at_the_paper_broker(tmp_path):
+    now = at(MON, "09:20")
+    svc = make_svc(tmp_path, md_at(now), now=now, spy=False)
+    set_autopilot(svc.store, True)
+    svc.store.upsert_position(Position(LEARN, "GOLDBEES", 5, 95.0, 90.0, 120.0, now))
+    sell = TradeIdea(id="s1", symbol="GOLDBEES", side=Side.SELL, limit_price=100.0, stop=100.0, target=100.0,
+                     expected_move_pct=0.0, confidence=0.6, holding_days=1, reason="exit early")
+    stage_ideas(svc, [sell])
+    await pipeline.open_session(svc, now)
+    assert svc.store.pending_orders() == [] and svc.store.positions(LEARN) == []
+    (fill,) = svc.store.fills(LEARN, at(MON, "00:00"), at(MON, "23:59"))
+    assert fill.side is Side.SELL and fill.price == round(100.0 * 0.997, 2)
 
 
 async def test_open_session_skips_idea_already_beyond_target(tmp_path):
@@ -227,7 +258,7 @@ async def test_open_session_sell_idea_reanchored_only_when_held(tmp_path):
     svc.store.upsert_position(Position(LEARN, "GOLDBEES", 5, 95.0, 90.0, 120.0, now))
     svc.store.set_state("acted_ideas", [])
     await pipeline.open_session(svc, now)
-    assert svc.store.get_idea("s1").limit_price == 101.23
+    assert svc.store.get_idea("s1").limit_price == 100.73      # the bottom of the band: a marketable sell
     assert svc.notifier.cards[0][0].sizes == {LEARN: 5}
 
 
