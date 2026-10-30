@@ -14,6 +14,11 @@ Three kinds of order, with different rules:
 
 A BUY flagged ``is_exit`` is not an exit: it is rejected, and still judged by every entry rule.
 
+Orders that are approved but not yet filled (PENDING in the store) already claim capacity, so the
+counters, the held quantity and the position cap include them. The order under check is always
+left out (matched by id), because the executor re-checks a pending order on retry and it must
+not be counted against itself.
+
 Money comparisons use ``TOLERANCE`` (a millionth of a rupee) so float noise at an exact boundary
 cannot flip a decision; it is far below one tick, so it never lets a real breach through.
 """
@@ -51,6 +56,11 @@ def _usable(x: float) -> bool:
 
 def _aware(t: datetime) -> bool:
     return t.tzinfo is not None and t.utcoffset() is not None
+
+
+def _created_on(o: Order, day: date) -> bool:
+    """True if ``o`` was created on the IST calendar day ``day``."""
+    return o.created_at.astimezone(IST).date() == day
 
 
 class RiskManager:
@@ -113,10 +123,18 @@ class RiskManager:
         if not qty_ok:
             reasons.append("quantity must be a whole number of at least 1")
         position = self._position(order) if known else None
+        # Approved-but-unfilled orders of this book, without the order being checked.
+        pending = self._pending(order) if known else []
         if kind != "entry" and qty_ok and known:
             held = position.qty if position is not None else 0
-            if order.qty > held:
-                reasons.append(f"sell quantity {order.qty} exceeds the {held} held")
+            pending_sells = sum(p.qty for p in pending
+                                if p.side == Side.SELL and p.symbol == order.symbol)
+            if order.qty > held - pending_sells:
+                if pending_sells:
+                    reasons.append(f"sell quantity {order.qty} exceeds the {held} held, of which "
+                                   f"{pending_sells} already pending sale")
+                else:
+                    reasons.append(f"sell quantity {order.qty} exceeds the {held} held")
 
         # Limit price against the last price.
         limit_ok = _usable(order.limit_price)
@@ -127,13 +145,13 @@ class RiskManager:
 
         if kind == "entry":
             if known:
-                reasons += self._check_entry_book_rules(order, book_cfg, book_limits, now, today)
+                reasons += self._check_entry_book_rules(order, book_cfg, book_limits, now, today, pending)
             if known and qty_ok and limit_ok:
-                reasons += self._check_position_value(order, book_cfg, position, quote, price)
+                reasons += self._check_position_value(order, book_cfg, position, quote, price, pending)
             if qty_ok and limit_ok:
                 reasons += self._check_cost(order, idea)
         elif kind == "sell" and known:
-            reasons += self._check_sell_days(order.book, book_cfg, today)
+            reasons += self._check_sell_days(order.book, book_cfg, today, pending)
 
         return RiskDecision(approved=not reasons, reasons=reasons)
 
@@ -175,22 +193,28 @@ class RiskManager:
         return []
 
     def _check_entry_book_rules(self, order: Order, book_cfg: BookConfig, book_limits: LossLimits,
-                                now: datetime, today: date) -> list[str]:
+                                now: datetime, today: date, pending: list[Order]) -> list[str]:
+        """Limit state, entries per day and one-buy-per-symbol-per-day, counting pending buys."""
         reasons = []
         state = book_limits.state(now)
         if state is not LimitState.ACTIVE:
             reasons.append(_STATE_REASONS[state])
-        entries = self._store.entries_on(order.book, today)
+        pending_buys_today = [p for p in pending
+                              if p.side == Side.BUY and not p.is_exit and _created_on(p, today)]
+        entries = self._store.entries_on(order.book, today) + len(pending_buys_today)
         if entries >= book_cfg.max_entries_per_day:
             reasons.append(f"daily entry limit reached ({entries}/{book_cfg.max_entries_per_day})")
-        if self._store.bought_today(order.book, order.symbol, today):
+        if (self._store.bought_today(order.book, order.symbol, today)
+                or any(p.symbol == order.symbol for p in pending_buys_today)):
             reasons.append(f"already bought {order.symbol} today")
         return reasons
 
     def _check_position_value(self, order: Order, book_cfg: BookConfig, position: Position | None,
-                              quote: Quote | None, price: float | None) -> list[str]:
-        """Value after the buy (existing holding of the symbol included) <= cap % of book equity.
+                              quote: Quote | None, price: float | None,
+                              pending: list[Order]) -> list[str]:
+        """Value after the buy <= cap % of book equity.
 
+        The value is this order plus the existing holding of the symbol plus its pending buys.
         Equity is marked at ``quote``; any other holding falls back to its average price.
         """
         quotes = {quote.symbol: quote} if quote is not None else {}
@@ -202,6 +226,8 @@ class RiskManager:
         if position is not None:
             # The same mark book_equity uses for this holding.
             value += position.qty * (price if price is not None else position.avg_price)
+        value += sum(p.qty * p.limit_price for p in pending
+                     if p.side == Side.BUY and p.symbol == order.symbol)
         cap = book_cfg.max_position_pct / 100 * equity
         if value > cap + TOLERANCE:
             return [f"position ₹{value:,.2f} would exceed {book_cfg.max_position_pct:g}% of equity "
@@ -212,6 +238,8 @@ class RiskManager:
         """Expected gain must cover ``cost_multiple`` times the round-trip charges."""
         if idea is None:
             return ["entry needs a trade idea for the cost check"]
+        if idea.symbol != order.symbol:
+            return ["idea is for a different symbol"]
         multiple = self._settings.risk.cost_multiple
         charges = round_trip_charges(order.qty, order.limit_price, order.limit_price,
                                      self._settings.charges)
@@ -221,10 +249,17 @@ class RiskManager:
                     f"₹{charges:,.2f}"]
         return []
 
-    def _check_sell_days(self, book: str, book_cfg: BookConfig, today: date) -> list[str]:
-        """A discretionary sell may start a new sell day only while this week has fewer than the cap."""
+    def _check_sell_days(self, book: str, book_cfg: BookConfig, today: date,
+                         pending: list[Order]) -> list[str]:
+        """A discretionary sell may start a new sell day only while this week has fewer than the cap.
+
+        Today already counts as a sell day if a non-exit SELL filled today or one is pending that
+        was created today (it was approved against the cap and will use today's slot).
+        """
         cap = book_cfg.max_sell_days_per_week
         if cap is None:
+            return []
+        if any(p.side == Side.SELL and not p.is_exit and _created_on(p, today) for p in pending):
             return []
         day_fills = self._store.fills(book, at(today, "00:00"), at(today + timedelta(days=1), "00:00"))
         if any(f.side == Side.SELL and not f.is_exit for f in day_fills):
@@ -233,6 +268,10 @@ class RiskManager:
         if days >= cap:
             return [f"weekly sell-day cap reached ({days}/{cap} days)"]
         return []
+
+    def _pending(self, order: Order) -> list[Order]:
+        """PENDING orders in ``order.book``, excluding ``order`` itself (an executor retry re-checks it)."""
+        return [p for p in self._store.pending_orders(order.book) if p.id != order.id]
 
     def _position(self, order: Order) -> Position | None:
         return next((p for p in self._store.positions(order.book) if p.symbol == order.symbol), None)

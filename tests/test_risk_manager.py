@@ -7,7 +7,7 @@ import pytest
 from aitrader.calendar import at
 from aitrader.charges import round_trip_charges
 from aitrader.config import load_settings
-from aitrader.models import Fill, Order, Position, Quote, Side, TradeIdea
+from aitrader.models import Fill, Order, OrderStatus, Position, Quote, Side, TradeIdea
 from aitrader.risk.limits import LimitState, LossLimits
 from aitrader.risk.manager import RiskDecision, RiskManager
 from aitrader.store import Store
@@ -56,9 +56,10 @@ def rm(store, limits):
 # ---------------------------------------------------------------- helpers
 
 
-def order(side=Side.BUY, qty=3, limit=280.0, is_exit=False, symbol=SYMBOL, book=BOOK, id="o1"):
+def order(side=Side.BUY, qty=3, limit=280.0, is_exit=False, symbol=SYMBOL, book=BOOK, id="o1",
+          created_at=NOON, status=OrderStatus.PENDING):
     return Order(id=id, book=book, symbol=symbol, side=side, qty=qty, limit_price=limit,
-                 reason="test", is_exit=is_exit, idea_id="i1", created_at=NOON)
+                 reason="test", is_exit=is_exit, idea_id="i1", created_at=created_at, status=status)
 
 
 def buy(**kw):
@@ -106,6 +107,15 @@ _fill_ids = iter(range(10_000))
 def add_fill(store, side, ts, is_exit=False, symbol=SYMBOL, book=BOOK, qty=1, price=280.0):
     store.save_fill(Fill(order_id=f"f{next(_fill_ids)}", book=book, symbol=symbol, side=side, qty=qty,
                          price=price, charges=0.0, is_exit=is_exit, ts=ts))
+
+
+def add_pending(store, side, qty=3, limit=280.0, is_exit=False, symbol=SYMBOL, book=BOOK,
+                created=at(MON, "11:00"), status=OrderStatus.PENDING):
+    """Save an approved-but-unfilled order (a different id from the order under check)."""
+    o = order(side, qty=qty, limit=limit, is_exit=is_exit, symbol=symbol, book=book,
+              id=f"p{next(_fill_ids)}", created_at=created, status=status)
+    store.save_order(o)
+    return o
 
 
 def check(rm, o, now=NOON, q="fresh", i=GOOD_IDEA):
@@ -261,7 +271,7 @@ def test_quote_without_timezone_is_rejected_not_raised(rm):
 
 
 def test_symbol_not_in_universe_blocks_entry(rm):
-    only_reason(check(rm, buy(symbol="TCS"), q=quote(NOON, symbol="TCS")), "universe")
+    only_reason(check(rm, buy(symbol="TCS"), i=idea(symbol="TCS")), "universe")
 
 
 @pytest.mark.parametrize("kind", ["sell", "exit"])
@@ -670,3 +680,158 @@ def test_check_does_not_write_to_the_store(rm, store):
     check(rm, buy(qty=0))
     after = (store.cash(BOOK), store.positions(BOOK), store.pending_orders(), store.risk_approved("o1"))
     assert before == after
+
+
+# ---------------------------------------------------------------- pending (approved, unfilled) orders
+
+
+def test_pending_buy_counts_toward_the_entry_cap(rm, store):
+    add_pending(store, Side.BUY, symbol="GOLDBEES")
+    only_reason(check(rm, buy()), "daily entry limit reached (1/1)")
+
+
+def test_pending_buys_and_fills_add_up_toward_the_entry_cap(rm, store):
+    add_pending(store, Side.BUY, symbol="GOLDBEES", book=LEARNING)
+    add_pending(store, Side.BUY, symbol="RELIANCE", book=LEARNING)
+    assert check(rm, buy(book=LEARNING)).approved                       # 2 of 3
+    add_fill(store, Side.BUY, at(MON, "10:00"), symbol="BANKBEES", book=LEARNING)
+    only_reason(check(rm, buy(book=LEARNING)), "daily entry limit reached (3/3)")
+
+
+def test_pending_buy_from_yesterday_does_not_count_toward_todays_entry_cap(rm, store):
+    add_pending(store, Side.BUY, symbol="GOLDBEES", created=at(FRI, "11:00"))
+    assert check(rm, buy()).approved
+
+
+def test_pending_sells_other_books_and_closed_orders_do_not_count_as_entries(rm, store):
+    add_pending(store, Side.SELL, symbol="GOLDBEES")
+    add_pending(store, Side.BUY, symbol="GOLDBEES", book=LEARNING)
+    add_pending(store, Side.BUY, symbol="GOLDBEES", status=OrderStatus.CANCELLED)
+    add_pending(store, Side.BUY, symbol="GOLDBEES", status=OrderStatus.REJECTED)
+    assert check(rm, buy()).approved
+
+
+def test_pending_buy_of_the_same_symbol_blocks_a_rebuy(rm, store):
+    add_pending(store, Side.BUY, book=LEARNING)
+    only_reason(check(rm, buy(book=LEARNING)), f"already bought {SYMBOL} today")
+
+
+def test_pending_buy_of_another_symbol_or_book_or_day_does_not_block_a_buy(rm, store):
+    add_pending(store, Side.BUY, symbol="GOLDBEES", book=LEARNING)                       # other symbol
+    add_pending(store, Side.BUY, book=BOOK)                                              # other book
+    add_pending(store, Side.BUY, book=LEARNING, created=at(FRI, "11:00"))                # yesterday
+    assert check(rm, buy(book=LEARNING)).approved
+
+
+def test_position_cap_counts_pending_buy_value(rm, store):
+    q = quote(NOON, price=200.0)
+    # learning cap: 20% of 100000 = 20000. The pending buy is from yesterday, so only the cap sees it.
+    assert check(rm, buy(book=LEARNING, qty=41, limit=200.0), q=q).approved            # 8200 alone fits
+    add_pending(store, Side.BUY, qty=60, limit=200.0, book=LEARNING, created=at(FRI, "11:00"))  # 12000
+    only_reason(check(rm, buy(book=LEARNING, qty=41, limit=200.0), q=q), "20% of equity")   # 20200
+    assert check(rm, buy(book=LEARNING, qty=39, limit=200.0), q=q).approved                 # 19800
+
+
+def test_position_cap_ignores_pending_buys_of_other_symbols_and_sells(rm, store):
+    q = quote(NOON, price=200.0)
+    add_pending(store, Side.BUY, qty=60, limit=200.0, symbol="GOLDBEES", book=LEARNING)
+    add_pending(store, Side.SELL, qty=60, limit=200.0, book=LEARNING)
+    assert check(rm, buy(book=LEARNING, qty=41, limit=200.0), q=q).approved
+
+
+def test_two_sells_cannot_together_exceed_the_holding(rm, store):
+    hold(store, qty=3)
+    add_pending(store, Side.SELL, qty=3)
+    only_reason(check(rm, sell(qty=3)), "3 already pending sale")
+    only_reason(check(rm, exit_(qty=3)), "3 already pending sale")
+
+
+def test_pending_sell_leaves_the_rest_of_the_holding_available(rm, store):
+    hold(store, qty=3)
+    add_pending(store, Side.SELL, qty=2)
+    assert check(rm, sell(qty=1)).approved
+    only_reason(check(rm, sell(qty=2)), "already pending sale")
+
+
+def test_pending_exit_sell_blocks_a_discretionary_sell(rm, store):
+    hold(store, qty=3)
+    add_pending(store, Side.SELL, qty=3, is_exit=True)
+    only_reason(check(rm, sell(qty=3)), "already pending sale")
+
+
+def test_pending_sell_from_an_earlier_day_still_reserves_the_holding(rm, store):
+    hold(store, qty=3)
+    add_pending(store, Side.SELL, qty=3, created=at(FRI, "11:00"))
+    only_reason(check(rm, sell(qty=3)), "already pending sale")
+
+
+def test_pending_buys_other_symbols_and_other_books_do_not_reduce_what_can_be_sold(rm, store):
+    hold(store, qty=3)
+    add_pending(store, Side.BUY, qty=5)                                    # not owned yet
+    add_pending(store, Side.SELL, qty=3, symbol="GOLDBEES")
+    add_pending(store, Side.SELL, qty=3, book=LEARNING)
+    assert check(rm, sell(qty=3)).approved
+    assert check(rm, exit_(qty=3)).approved
+
+
+def test_pending_sell_today_makes_today_a_sell_day(rm, store):
+    hold(store, qty=6)
+    three_sell_days(store)
+    now = at(THU, "12:00")
+    only_reason(check(rm, sell(), now=now), "sell-day cap")                     # control: no pending
+    add_pending(store, Side.SELL, qty=3, created=at(THU, "10:00"))
+    assert check(rm, sell(), now=now).approved                                  # 3 of 6 still free
+
+
+def test_pending_exit_sell_today_does_not_make_today_a_sell_day(rm, store):
+    hold(store, qty=6)
+    three_sell_days(store)
+    add_pending(store, Side.SELL, qty=3, is_exit=True, created=at(THU, "10:00"))
+    only_reason(check(rm, sell(), now=at(THU, "12:00")), "sell-day cap")
+
+
+def test_pending_sell_from_an_earlier_day_does_not_make_today_a_sell_day(rm, store):
+    hold(store, qty=6)
+    three_sell_days(store)
+    add_pending(store, Side.SELL, qty=3, created=at(WED, "13:00"))
+    only_reason(check(rm, sell(), now=at(THU, "12:00")), "sell-day cap")
+
+
+def test_order_under_check_is_not_counted_against_itself_for_the_entry_cap(rm, store):
+    o = buy(id="retry")
+    store.save_order(o)                                  # approved earlier, still PENDING
+    d = check(rm, o)
+    assert d.approved, d.reasons
+
+
+def test_order_under_check_is_not_counted_against_itself_for_bought_today(rm, store):
+    o = buy(book=LEARNING, id="retry")
+    store.save_order(o)
+    assert check(rm, o).approved
+
+
+def test_order_under_check_is_not_counted_against_itself_for_the_position_cap(rm, store):
+    o = buy(book=LEARNING, qty=71, id="retry")           # 19880 fits under 20000; counted twice it would not
+    store.save_order(o)
+    assert check(rm, o).approved
+
+
+@pytest.mark.parametrize("kind", ["sell", "exit"])
+def test_order_under_check_is_not_counted_against_itself_for_the_held_qty(rm, store, kind):
+    hold(store, qty=3)
+    o = make(kind, qty=3, id="retry")
+    store.save_order(o)
+    assert check(rm, o).approved
+
+
+def test_order_under_check_does_not_make_today_a_sell_day_for_itself(rm, store):
+    hold(store, qty=3)
+    three_sell_days(store)
+    now = at(THU, "12:00")
+    o = sell(qty=3, id="retry", created_at=now)
+    store.save_order(o)
+    only_reason(check(rm, o, now=now), "sell-day cap")
+
+
+def test_idea_for_a_different_symbol_is_rejected(rm):
+    only_reason(check(rm, buy(), i=idea(symbol="GOLDBEES")), "idea is for a different symbol")
