@@ -287,6 +287,11 @@ class Store:
             params += (book,)
         return [_order(r) for r in self._read(sql + " ORDER BY created_at, id", params)]
 
+    def orders_with_status(self, status: OrderStatus) -> list[Order]:
+        """Every order in ``status`` across all books, oldest first (the go-live audit reads FILLED)."""
+        rows = self._read("SELECT * FROM orders WHERE status = ? ORDER BY created_at, id", (str(status),))
+        return [_order(r) for r in rows]
+
     def save_fill(self, f: Fill) -> None:
         self._write(
             "INSERT INTO fills (order_id, book, symbol, side, qty, price, charges, is_exit, ts)"

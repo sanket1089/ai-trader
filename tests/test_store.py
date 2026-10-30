@@ -590,3 +590,13 @@ def test_store_commits_per_call_again_after_a_rolled_back_transaction(tmp_path):
         assert raw_rows(path, "SELECT COUNT(*) FROM cash") == [(2,)]
     finally:
         s.close()
+
+
+def test_orders_with_status(store):
+    store.save_order(order(id="a", status=OrderStatus.FILLED))
+    store.save_order(order(id="b", status=OrderStatus.PENDING))
+    store.save_order(order(id="c", status=OrderStatus.FILLED, book="realistic"))
+    filled = store.orders_with_status(OrderStatus.FILLED)
+    assert [o.id for o in filled] == ["a", "c"]
+    assert all(o.status is OrderStatus.FILLED for o in filled)
+    assert store.orders_with_status(OrderStatus.REJECTED) == []

@@ -12,8 +12,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import feedparser
+import httpx
 
 from aitrader.calendar import IST
+from aitrader.data import BROWSER_USER_AGENT
 
 log = logging.getLogger(__name__)
 
@@ -144,3 +146,38 @@ def prefilter(
     if pattern is None:
         return []
     return [i for i in items if pattern.search(f"{i.title}\n{i.summary}")]
+
+
+def count_hits(items: list[NewsItem], symbols: dict[str, list[str]]) -> dict[str, int]:
+    """Number of items mentioning each symbol (or one of its aliases), with the prefilter's matcher.
+
+    Symbols with no hits are left out.
+    """
+    hits: dict[str, int] = {}
+    texts = [f"{i.title}\n{i.summary}" for i in items]
+    for symbol, aliases in symbols.items():
+        pattern = _term_pattern([symbol, *aliases])
+        if pattern is None:
+            continue
+        n = sum(1 for text in texts if pattern.search(text))
+        if n:
+            hits[symbol] = n
+    return hits
+
+
+def http_parse(url: str, http_get=httpx.get, timeout: float = 15):
+    """``feedparser.parse`` over a timeout-bounded HTTP fetch (feedparser's own fetch can hang).
+
+    An HTTP error status or any exception gives a failed-feed result (``bozo`` true, no entries,
+    the status when there is one), which ``fetch_news`` warns about and skips. Only the error's
+    type is kept: its message may hold the URL.
+    """
+    try:
+        resp = http_get(url, timeout=timeout, headers={"User-Agent": BROWSER_USER_AGENT},
+                        follow_redirects=True)
+    except Exception as exc:  # noqa: BLE001 - a dead feed is skipped, never fatal
+        return {"bozo": True, "bozo_exception": type(exc).__name__, "entries": []}
+    status = getattr(resp, "status_code", None)
+    if not isinstance(status, int) or status >= 400:
+        return {"bozo": True, "bozo_exception": f"HTTP {status}", "entries": [], "status": status}
+    return feedparser.parse(resp.content)

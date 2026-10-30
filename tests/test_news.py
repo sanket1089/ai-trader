@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from aitrader.calendar import IST
-from aitrader.data.news import NewsItem, fetch_news, prefilter
+from aitrader.data.news import NewsItem, count_hits, fetch_news, http_parse, prefilter
 
 SINCE = datetime(2026, 10, 30, 9, 0, tzinfo=IST)  # 03:30 UTC
 
@@ -263,3 +263,55 @@ def test_prefilter_ignores_blank_terms_and_empty_input():
     items = [item("Anything at all")]
     assert prefilter(items, {"": [""], "TCS": ["  "]}, market_keywords=["", "  "]) == []
     assert prefilter([], {"TCS": []}, market_keywords=["RBI"]) == []
+
+
+# ---- count_hits (RULING 23) and the timeout-bounded HTTP parse (RULING 25) ----
+
+def _hit_item(title, summary=""):
+    return NewsItem(title=title, summary=summary, link=f"https://x/{title}", published=SINCE, source="s")
+
+
+def test_count_hits_uses_symbols_and_aliases():
+    items = [_hit_item("Reliance Industries rallies"), _hit_item("RELIANCE and TCS up"),
+             _hit_item("TCSL slips"), _hit_item("Markets flat", summary="Tata Consultancy wins order")]
+    hits = count_hits(items, {"RELIANCE": ["Reliance Industries"], "TCS": ["Tata Consultancy"], "INFY": []})
+    assert hits == {"RELIANCE": 2, "TCS": 2}
+
+
+class _Resp:
+    def __init__(self, status, content=b""):
+        self.status_code = status
+        self.content = content
+
+
+RSS = (b"<?xml version='1.0'?><rss version='2.0'><channel><title>T</title><item><title>Nifty up</title>"
+       b"<link>https://x/1</link><pubDate>Fri, 30 Oct 2026 04:00:00 GMT</pubDate></item></channel></rss>")
+
+
+def test_http_parse_reads_feed_with_timeout_and_user_agent():
+    seen = {}
+
+    def get(url, **kw):
+        seen.update(kw, url=url)
+        return _Resp(200, RSS)
+
+    parsed = http_parse("https://feed", http_get=get)
+    assert seen["timeout"] == 15 and "Mozilla" in seen["headers"]["User-Agent"] and seen["follow_redirects"]
+    assert parsed.get("entries")[0]["title"] == "Nifty up"
+    items = fetch_news(["https://feed"], SINCE, parse=lambda u: http_parse(u, http_get=get))
+    assert [i.title for i in items] == ["Nifty up"]
+
+
+def test_http_parse_error_status_and_exception_are_failed_feeds(caplog):
+    bad = http_parse("https://feed", http_get=lambda url, **kw: _Resp(503))
+    assert bad["bozo"] and bad["entries"] == [] and bad["status"] == 503
+
+    def boom(url, **kw):
+        raise TimeoutError("read timed out https://secret")
+
+    failed = http_parse("https://feed", http_get=boom)
+    assert failed["bozo"] and failed["entries"] == []
+    with caplog.at_level(logging.WARNING):
+        assert fetch_news(["https://feed"], SINCE, parse=lambda u: failed) == []
+    assert "could not be parsed" in caplog.text
+    assert "secret" not in caplog.text
