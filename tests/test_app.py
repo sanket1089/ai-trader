@@ -10,6 +10,8 @@ from pipeline_fakes import (LEARN, REAL, REPO_CONFIG, SETTINGS, FakeLLM, FakeMar
 from telegram.ext import Application
 
 from aitrader import app as app_mod
+from aitrader.__main__ import main as cli_main
+from aitrader.__main__ import settings_for_run
 from aitrader.app import Services, guarded, schedule_jobs
 from aitrader.calendar import at
 from aitrader.control import JOBS
@@ -73,6 +75,37 @@ def test_build_services_dry_run_reaches_executor(tmp_path):
                                  llm_client=FakeLLM(), http_get=csv_get(), clock=lambda: now)
     assert svc.dry_run is True and svc.executor._dry_run is True
     svc.store.close()
+
+
+def test_dry_run_services_do_not_start_phase1(tmp_path):
+    now = at(MON, "08:00")
+    settings = SETTINGS.model_copy(update={"db_path": tmp_path / "x.db"})
+    svc = app_mod.build_services(settings, RecordingNotifier(), dry_run=True, market_data=md(now),
+                                 llm_client=FakeLLM(), http_get=csv_get(), clock=lambda: now)
+    assert svc.store.get_state("phase1_start") is None
+    assert svc.store.cash(REAL) == 1000.0                          # the books still get their cash
+    svc.store.close()
+
+
+def test_dry_run_resolves_to_its_own_database(tmp_path):
+    settings = SETTINGS.model_copy(update={"db_path": tmp_path / "data" / "aitrader.db"})
+    assert settings_for_run(settings, True).db_path == tmp_path / "data" / "dryrun.db"
+    assert settings_for_run(settings, False).db_path == tmp_path / "data" / "aitrader.db"
+
+
+def test_run_dry_run_cli_prints_and_uses_dryrun_db(tmp_path, monkeypatch, capsys):
+    config = tmp_path / "config.yaml"
+    config.write_text(REPO_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:dummy")
+    monkeypatch.setenv("TELEGRAM_OWNER_CHAT_ID", "42")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)          # stops before anything connects
+
+    assert cli_main(["run", "--dry-run", "--config", str(config)]) == 2
+
+    out = capsys.readouterr().out
+    assert f"Database: {tmp_path / 'data' / 'dryrun.db'}" in out
+    assert "aitrader.db" not in out
+    assert not (tmp_path / "data" / "aitrader.db").exists()
 
 
 # ---------------------------------------------------------------- guard

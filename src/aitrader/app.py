@@ -1,8 +1,9 @@
 """Wiring: ``Services`` (everything the jobs and the bot share), the job guard and the schedule.
 
 ``build_services`` is restart-safe: cash, the loss-limit baselines and ``phase1_start`` are seeded
-only on the first run. ``schedule_jobs`` registers the jobs of ``pipeline.py`` on PTB's JobQueue at
-the IST times of ``ScheduleConfig``; every job runs through ``guarded``.
+only on the first run (``phase1_start`` never in a dry run). ``schedule_jobs`` registers the jobs of
+``pipeline.py`` on PTB's JobQueue at the IST times of ``ScheduleConfig``; every job runs through
+``guarded``.
 """
 
 import logging
@@ -137,7 +138,8 @@ def build_services(settings: Settings, notifier: Any, dry_run: bool, market_data
             if not store.has_cash(book.name):
                 store.set_cash(book.name, float(book.capital))
                 log.info("seeded %s with cash %.2f", book.name, book.capital)
-        if store.get_state(PHASE1_START_KEY) is None:
+        # A dry run never starts the Phase 1 clock (it has its own database; this is defence in depth).
+        if store.get_state(PHASE1_START_KEY) is None and not dry_run:
             store.set_state(PHASE1_START_KEY, clock().astimezone(IST).date().isoformat())
     limits = {b.name: LossLimits(store, b, settings.holidays) for b in settings.books}   # seeds baselines once
 

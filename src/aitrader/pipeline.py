@@ -8,11 +8,15 @@ State keys (all via ``store.set_state``):
 
 * ``news_since`` (ISO datetime): news is fetched from here on; moved forward on every fetch.
 * ``todays_ideas`` (list of idea ids) and ``todays_ideas_day`` (ISO date): today's PM ideas.
-  open_session acts only on ideas from today.
+  open_session acts only on ideas from today. Premarket (also on a data-down morning) resets
+  ``acted_ideas``, ``closed_ideas`` and ``idea_created`` (see ``pipeline_support``); premarket and
+  intraday record each new idea's creation time.
 * ``shortlist`` (symbols), ``premarket_prices`` ({symbol: price}), ``news_digest`` and
   ``technicals`` (model dumps): premarket's view, which intraday compares against and reuses.
 * ``last_intraday_ai`` (ISO datetime): last intraday AI run (at most one per 2 hours when REDUCED).
-* ``bench_start`` ({"day", "price"}): NIFTYBEES' close on the first postmarket, for the benchmark.
+  Intraday makes no AI call while entries are paused or stopped, or while no book is ACTIVE.
+* ``bench_start`` ({"day", "price"}): NIFTYBEES' close on the first postmarket, for the benchmark
+  (never seeded in a dry run).
 * ``fundamentals`` ({symbol: FundamentalView dump}): written weekly, kept when unavailable.
 """
 
@@ -36,11 +40,15 @@ from aitrader.models import Quote
 from aitrader.pipeline_support import (
     ACTED_KEY,
     BENCH,
+    CLOSED_KEY,
     FUNDAMENTALS_KEY,
+    IDEA_CREATED_KEY,
+    TODAYS_IDEAS_KEY,
     act_on_ideas,
     ai_allowed,
     book_names,
     check_limits,
+    entries_blocked,
     fetch_quotes,
     held_symbols,
     inr,
@@ -49,11 +57,13 @@ from aitrader.pipeline_support import (
     load_model,
     notify,
     pm_context,
+    record_ideas_created,
     unacted_ideas,
     usable,
     usd,
 )
 from aitrader.risk.equity import book_equity
+from aitrader.risk.limits import LimitState
 from aitrader.risk.manager import MARKET_CLOSE
 
 log = logging.getLogger(__name__)
@@ -67,7 +77,6 @@ NEWS_LOOKBACK = timedelta(hours=24)
 MARKET_KEYWORDS = ["Nifty", "Sensex", "NSE", "BSE", "RBI", "SEBI", "repo rate", "inflation", "FII", "DII",
                    "rupee", "crude", "GDP", "stock market", "Dalal Street"]
 
-TODAYS_IDEAS_KEY = "todays_ideas"
 TODAYS_DAY_KEY = "todays_ideas_day"
 NEWS_SINCE_KEY = "news_since"
 SHORTLIST_KEY = "shortlist"
@@ -149,8 +158,12 @@ async def premarket(svc: Any, now: datetime) -> None:
         await notify(svc, f"Data feed down: no quote or daily history for {BENCH}. Skipping today's premarket "
                           "AI steps; stop/target exits and loss limits keep running.")
         with store.transaction():                      # nothing from an earlier day may be reused
-            for key in (SHORTLIST_KEY, PREMARKET_PRICES_KEY, TECHNICALS_KEY, NEWS_DIGEST_KEY, TODAYS_IDEAS_KEY):
+            for key in (SHORTLIST_KEY, PREMARKET_PRICES_KEY, TECHNICALS_KEY, NEWS_DIGEST_KEY, TODAYS_IDEAS_KEY,
+                        IDEA_CREATED_KEY):
                 store.set_state(key, None)
+            # Yesterday's acted (symbol, side) pairs must not block today's intraday ideas.
+            store.set_state(ACTED_KEY, [])
+            store.set_state(CLOSED_KEY, [])
         return
 
     items = await _news_since_last(svc, now)
@@ -169,6 +182,8 @@ async def premarket(svc: Any, now: datetime) -> None:
         store.set_state(TODAYS_IDEAS_KEY, [])
         store.set_state(TODAYS_DAY_KEY, ist_day(now))
         store.set_state(ACTED_KEY, [])
+        store.set_state(CLOSED_KEY, [])
+        store.set_state(IDEA_CREATED_KEY, {})
         store.set_state(NEWS_DIGEST_KEY, None)
         store.set_state(TECHNICALS_KEY, None)
 
@@ -183,7 +198,9 @@ async def premarket(svc: Any, now: datetime) -> None:
 
     ctx = await pm_context(svc, now, quotes, news=digest, technicals=technicals)
     ideas = await asyncio.to_thread(run_portfolio_manager, svc.llm, store, ctx)
-    store.set_state(TODAYS_IDEAS_KEY, [i.id for i in ideas])
+    with store.transaction():
+        record_ideas_created(store, ideas, now)
+        store.set_state(TODAYS_IDEAS_KEY, [i.id for i in ideas])
     listed = "; ".join(f"{i.side} {i.symbol} @ {inr(i.limit_price)}" for i in ideas) or "none"
     await notify(svc, f"Premarket: {len(relevant)} relevant news item(s), {len(shortlist)} stocks shortlisted. "
                       f"Ideas for today: {listed}.")
@@ -232,7 +249,16 @@ async def intraday(svc: Any, now: datetime) -> None:
     await _expire_cards(svc, now)
     pending = store.pending_orders()
     await svc.executor.retry_pending(await fetch_quotes(svc, {o.symbol for o in pending}), now)
-    await check_limits(svc, now)
+    evals = await check_limits(svc, now)
+
+    # No billed AI call for ideas nobody could take: paused or stopped by the owner, or no book active.
+    if entries_blocked(svc):
+        log.info("intraday: entries are paused or stopped, no AI re-run")
+        return
+    states = [evals[name].state if name in evals else svc.limits[name].state(now) for name in book_names(svc)]
+    if LimitState.ACTIVE not in states:
+        log.info("intraday: no book is active (loss limits), no AI re-run")
+        return
 
     level = budget_level(store, svc.settings.ai, now)
     if level is BudgetLevel.EXHAUSTED:
@@ -258,8 +284,10 @@ async def intraday(svc: Any, now: datetime) -> None:
                            technicals=load_model(store, TECHNICALS_KEY, TechnicalBatch))
     ideas = await asyncio.to_thread(run_portfolio_manager, svc.llm, store, ctx)
     known = [i.id for i in _todays_ideas(svc, now)]
-    store.set_state(TODAYS_IDEAS_KEY, known + [i.id for i in ideas])
-    store.set_state(TODAYS_DAY_KEY, ist_day(now))
+    with store.transaction():
+        record_ideas_created(store, ideas, now)
+        store.set_state(TODAYS_IDEAS_KEY, known + [i.id for i in ideas])
+        store.set_state(TODAYS_DAY_KEY, ist_day(now))
     if ideas:
         await notify(svc, f"Intraday re-run ({reason}): {len(ideas)} new idea(s).")
         await act_on_ideas(svc, ideas, now)
@@ -329,7 +357,8 @@ async def postmarket(svc: Any, now: datetime) -> None:
             continue
         store.save_equity_snapshot(name, today, equities[name])
     await check_limits(svc, now, quotes)
-    if store.get_state(BENCH_START_KEY) is None and BENCH in prices:
+    # A dry run never seeds the benchmark start (it has its own database, this is defence in depth).
+    if store.get_state(BENCH_START_KEY) is None and BENCH in prices and not getattr(svc, "dry_run", False):
         store.set_state(BENCH_START_KEY, {"day": today.isoformat(), "price": prices[BENCH]})
 
     review = None

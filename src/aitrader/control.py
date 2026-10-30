@@ -13,12 +13,15 @@ State keys written here (all via ``store.set_state``):
 * ``paused`` and ``manual_stop`` (bool): block new entries; ``RiskManager`` reads them.
 * ``recovery_approved:<book>:<stop_id>`` (bool): the owner approved the recovery plan of that stop.
 * go-live flags ``tested_approval`` (a card first resolved APPROVED), ``tested_stop`` (first /stop)
-  and ``tested_expiry`` (first time a tap met an EXPIRED card).
+  and ``tested_expiry`` (first time a tap met an EXPIRED card). Never set in a dry run.
+* ``closed_ideas`` (via ``pipeline_support.close_open_ideas``): /pause and /stop close today's ideas
+  not acted on yet, so /resume never revives a thesis from hours earlier.
 
 State keys read here: ``last_run:<job>`` (an aware ISO datetime, written by the jobs) for /status.
 
 ``/stop`` and every other command are synchronous and have no ``await``, so on the event loop they
-cannot interleave with an order being placed.
+cannot interleave with an order being placed. ``handle_command_async`` is the event-loop entry: for
+/resume it first fetches the quotes it needs in a thread, then runs the command synchronously.
 """
 
 import asyncio
@@ -33,8 +36,9 @@ from typing import Any
 from aitrader.agents.llm import BudgetLevel, budget_level
 from aitrader.approvals import Resolution, get_autopilot, set_autopilot
 from aitrader.calendar import IST
-from aitrader.execution import describe_error, marketable_limit
-from aitrader.models import Order, OrderStatus, Quote
+from aitrader.execution import buy_stop_clear, describe_error, marketable_limit, slippage_pct
+from aitrader.models import Order, OrderStatus, Quote, Side
+from aitrader.pipeline_support import close_open_ideas
 from aitrader.risk.equity import book_equity
 from aitrader.risk.limits import LimitState
 from aitrader.risk.manager import MANUAL_STOP_KEY, PAUSED_KEY
@@ -96,18 +100,40 @@ def _recovery_key(book: str, stop_id: int) -> str:
     return f"recovery_approved:{book}:{stop_id}"
 
 
+def _mark_tested(svc: Any, key: str) -> None:
+    """Tick a go-live flag; a dry run never does (it has its own database: defence in depth)."""
+    if getattr(svc, "dry_run", False):
+        return
+    svc.store.set_state(key, True)
+
+
 def _describe_order(o: Order) -> str:
     return f"{o.book} {o.side} {o.qty} {o.symbol} @ limit {_inr(o.limit_price)}"
 
 
+def _held(svc: Any, books: Iterable[str]) -> list[str]:
+    return sorted({p.symbol for b in books for p in svc.store.positions(b)})
+
+
 def _quotes(svc: Any, books: Iterable[str]) -> dict[str, Quote]:
     """Quotes for everything the given books hold. A feed failure is logged and gives no quotes."""
-    symbols = sorted({p.symbol for b in books for p in svc.store.positions(b)})
+    symbols = _held(svc, books)
     if not symbols:
         return {}
     try:
         return dict(svc.market_data.quotes(symbols))
     except Exception as exc:  # noqa: BLE001 - a down feed must not break a status command
+        log.warning("quotes unavailable: %s", describe_error(exc))
+        return {}
+
+
+async def _quotes_in_thread(svc: Any, symbols: list[str]) -> dict[str, Quote]:
+    """``_quotes`` for the event loop: the blocking feed runs in a thread."""
+    if not symbols:
+        return {}
+    try:
+        return dict(await asyncio.to_thread(svc.market_data.quotes, symbols))
+    except Exception as exc:  # noqa: BLE001
         log.warning("quotes unavailable: %s", describe_error(exc))
         return {}
 
@@ -265,10 +291,17 @@ def _journal(args: list[str], svc: Any, now: datetime) -> str:
         f"{i}. {text if len(text) <= 500 else text[:497] + '...'}" for i, text in enumerate(lessons, 1))
 
 
+def _closed_ideas_note(count: int) -> str:
+    return (f"Closed {count} idea(s) from today that were not acted on yet; /resume will not revive them."
+            if count else "")
+
+
 def _pause(args: list[str], svc: Any, now: datetime) -> str:
     svc.store.set_state(PAUSED_KEY, True)
-    return ("Paused: no new entries in any book until /resume. Exits and sells still work. "
-            "(/stop also cancels pending orders.)")
+    closed = close_open_ideas(svc.store)
+    lines = ["Paused: no new entries in any book until /resume. Exits and sells still work. "
+             "(/stop also cancels pending orders.)", _closed_ideas_note(closed)]
+    return "\n".join(line for line in lines if line)
 
 
 def _stop(args: list[str], svc: Any, now: datetime) -> str:
@@ -276,7 +309,10 @@ def _stop(args: list[str], svc: Any, now: datetime) -> str:
     # The switches first: whatever happens while cancelling, nothing new can start.
     store.set_state(MANUAL_STOP_KEY, True)
     set_autopilot(store, False)
-    store.set_state(TESTED_STOP_KEY, True)
+    _mark_tested(svc, TESTED_STOP_KEY)
+    closed_ideas = close_open_ideas(store)
+    # An open card (a SELL too) must not be approvable after the kill switch.
+    closed_cards = svc.approvals.expire_all_open(now)
     if not callable(getattr(svc.executor, "cancel_order", None)):
         # No store-only fallback: a kill switch must never pretend to cancel a live order. The
         # switches above are already set, so nothing new can start; handle_command tells the owner.
@@ -306,6 +342,10 @@ def _stop(args: list[str], svc: Any, now: datetime) -> str:
         lines.append("Could not cancel (see the log): " + "; ".join(_describe_order(o) for o in failed))
     if exits:
         lines.append(f"{exits} pending exit order(s) left in place: stop and target exits keep working.")
+    if closed_cards:
+        lines.append(f"Closed {len(closed_cards)} open approval card(s): tapping them places nothing.")
+    if closed_ideas:
+        lines.append(_closed_ideas_note(closed_ideas))
     lines.append("Send /resume to lift the stop.")
     return "\n".join(lines)
 
@@ -320,7 +360,8 @@ def _cancel_pending(svc: Any, order: Order) -> bool:
     return bool(svc.executor.cancel_order(order.id, "cancelled: owner /stop"))
 
 
-def _resume(args: list[str], svc: Any, now: datetime) -> str:
+def _resume(args: list[str], svc: Any, now: datetime, quotes: dict[str, Quote] | None = None) -> str:
+    """``quotes``: prefetched by ``handle_command_async`` (in a thread); ``None`` fetches them here."""
     store = svc.store
     was = [label for key, label in ((PAUSED_KEY, "pause"), (MANUAL_STOP_KEY, "manual stop"))
            if store.get_state(key)]
@@ -334,19 +375,28 @@ def _resume(args: list[str], svc: Any, now: datetime) -> str:
         if state is LimitState.DAILY_PAUSED:
             lines.append(f"{name}: paused for the day by its daily loss limit; that clears next trading day.")
         elif state is LimitState.HARD_STOPPED:
-            lines.append(_resume_hard_stopped(svc, name, limits, books[name]))
+            lines.append(_resume_hard_stopped(svc, name, limits, books[name], quotes))
     if not get_autopilot(store):
         lines.append("Autopilot is OFF: send /autopilot on when you want it.")
     return "\n".join(lines)
 
 
-def _resume_hard_stopped(svc: Any, name: str, limits: Any, cfg: Any) -> str:
+def _resumable_books(svc: Any, now: datetime) -> list[str]:
+    """Hard-stopped books whose current stop has an approved recovery plan (/resume resets them)."""
+    return [name for name, limits in svc.limits.items()
+            if limits.state(now) is LimitState.HARD_STOPPED
+            and svc.store.get_state(_recovery_key(name, limits.stop_id())) is True]
+
+
+def _resume_hard_stopped(svc: Any, name: str, limits: Any, cfg: Any,
+                         quotes: dict[str, Quote] | None = None) -> str:
     """Lift a hard stop only if its recovery plan was approved; the new baseline is the current equity."""
     stop_id = limits.stop_id()
     if svc.store.get_state(_recovery_key(name, stop_id)) is not True:
         return (f"{name}: still hard stopped. A recovery plan must be approved first "
                 "(tap the ✅ button on its recovery plan message), then send /resume again.")
-    quotes = _quotes(svc, [name])
+    if quotes is None:
+        quotes = _quotes(svc, [name])
     try:
         equity = _equity(svc, name, quotes)
         limits.reset_baseline(equity)
@@ -387,18 +437,44 @@ _COMMANDS: dict[str, Callable[[list[str], Any, datetime], str]] = {
 COMMAND_NAMES = tuple(_COMMANDS)
 
 
+def _command_name(cmd: str) -> str:
+    return str(cmd).strip().lstrip("/").split("@", 1)[0].lower()
+
+
+def _failed(name: str, exc: Exception) -> str:
+    log.error("command /%s failed: %s", name, describe_error(exc))
+    return (f"/{name} hit an internal error ({type(exc).__name__}); see the log. "
+            "Send /status to see where things stand.")
+
+
 def handle_command(cmd: str, args: list[str], svc: Any, now: datetime) -> str:
     """Reply text for ``/cmd args``. Never raises."""
-    name = str(cmd).strip().lstrip("/").split("@", 1)[0].lower()
+    name = _command_name(cmd)
     handler = _COMMANDS.get(name)
     if handler is None:
         return f"Unknown command /{name[:30]}.\n{HELP}" if name else HELP
     try:
         return handler([str(a) for a in (args or [])], svc, _aware(now))
     except Exception as exc:  # noqa: BLE001 - the owner always gets an answer; only the type is shown
-        log.error("command /%s failed: %s", name, describe_error(exc))
-        return (f"/{name} hit an internal error ({type(exc).__name__}); see the log. "
-                "Send /status to see where things stand.")
+        return _failed(name, exc)
+
+
+async def handle_command_async(cmd: str, args: list[str], svc: Any, now: datetime) -> str:
+    """``handle_command`` for the event loop. Never raises.
+
+    /resume needs quotes to reset a hard-stopped book's baseline; the feed is blocking network, so
+    they are fetched first in a thread. The command itself then runs synchronously (its checks and its
+    writes have no ``await`` between them), exactly like every other command.
+    """
+    name = _command_name(cmd)
+    if name != "resume":
+        return handle_command(cmd, args, svc, now)
+    try:
+        when = _aware(now)
+        quotes = await _quotes_in_thread(svc, _held(svc, _resumable_books(svc, when)))
+        return _resume([str(a) for a in (args or [])], svc, when, quotes)
+    except Exception as exc:  # noqa: BLE001 - the owner always gets an answer; only the type is shown
+        return _failed(name, exc)
 
 
 # ---------------------------------------------------------------- approval cards
@@ -433,9 +509,10 @@ async def handle_card_tap(card_id: str, approve: bool, svc: Any, now: datetime) 
 
     The idea is always loaded from the store by the card's ``idea_id``; nothing else is trusted.
     APPROVED places one order per book with a size above 0 through ``svc.executor.submit``;
-    REISSUE closes the card and sends a fresh one at the current price. ``still_open`` is True when
-    the tap left the card unresolved (no current price, or its idea is missing): the adapter then
-    keeps the card's buttons so the owner can tap again.
+    REISSUE closes the card and sends a fresh one at the current price. A BUY whose stop is now at or
+    above the price less the broker's slippage is not placed: the card is closed as rejected.
+    ``still_open`` is True when the tap left the card unresolved (no current price, or its idea is
+    missing): the adapter then keeps the card's buttons so the owner can tap again.
     """
     card = svc.approvals.get(card_id)
     if card is None:
@@ -452,13 +529,25 @@ async def handle_card_tap(card_id: str, approve: bool, svc: Any, now: datetime) 
         if quote is None and card.status == "open" and now < card.expires_at:
             return CardResult(f"No current price for {idea.symbol} right now, so the card was not "
                               "resolved. It stays open: tap again in a moment.", still_open=True)
-    # A reject needs no price; an approve with no price on a card past its time still resolves (EXPIRED).
-    price = quote.price if quote is not None else (math.nan if approve else card.quote_at_issue)
-    resolution = svc.approvals.resolve(card_id, approve, price, now)
+    if (approve and quote is not None and idea.side == Side.BUY
+            and not buy_stop_clear(idea.stop, quote.price, slippage_pct(svc))):
+        # The price fell to the stop since the card went out: the entry would be under water at once.
+        # The card is closed (rejected) so its buttons go; a card already closed answers as usual below.
+        resolution = svc.approvals.resolve(card_id, False, card.quote_at_issue, now)
+        if resolution is Resolution.REJECTED:
+            log.info("card %s: %s at %.2f is at or below the stop %.2f; not placed",
+                     card_id, idea.symbol, quote.price, idea.stop)
+            return CardResult(f"Not placed: {idea.symbol} is now {_inr(quote.price)}, at or below the stop "
+                              f"{_inr(idea.stop)} once slippage is allowed for. The card was closed; "
+                              "nothing was ordered.")
+    else:
+        # A reject needs no price; an approve with no price on a card past its time still resolves (EXPIRED).
+        price = quote.price if quote is not None else (math.nan if approve else card.quote_at_issue)
+        resolution = svc.approvals.resolve(card_id, approve, price, now)
 
     what = f"{idea.side} {idea.symbol}" if idea is not None else "the trade"
     if resolution is Resolution.APPROVED:
-        svc.store.set_state(TESTED_APPROVAL_KEY, True)
+        _mark_tested(svc, TESTED_APPROVAL_KEY)
         return CardResult(await _place_orders(svc, card, idea, quote, now))
     if resolution is Resolution.REJECTED:
         return CardResult(f"Rejected {what}. Nothing was ordered.")
@@ -466,7 +555,7 @@ async def handle_card_tap(card_id: str, approve: bool, svc: Any, now: datetime) 
         if now >= card.expires_at:
             # Only a card that ran out of time counts as "expiry tested": a card closed early by a
             # re-issue is also EXPIRED, and a late second tap on it must not tick the go-live box.
-            svc.store.set_state(TESTED_EXPIRY_KEY, True)
+            _mark_tested(svc, TESTED_EXPIRY_KEY)
         return CardResult(f"This card for {what} has expired and was not placed. Wait for the next one.")
     if resolution is Resolution.ALREADY_RESOLVED:
         return CardResult("That card was already handled.")

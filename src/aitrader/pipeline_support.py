@@ -10,6 +10,11 @@ State keys written here:
   so no idea, and no second idea for the same (symbol, side), is acted on twice in a day. An idea
   is marked only when its card or order goes out; one skipped for a missing or stale quote waits
   for the next pass (``exits_job`` retries inside the entry window).
+* ``closed_ideas`` (list of idea ids): today's ideas closed unacted by /pause or /stop, so /resume
+  never revives them (reset by premarket). Unlike ``acted_ideas`` they do not block a later idea
+  for the same (symbol, side).
+* ``idea_created`` ({idea id: aware ISO datetime}): when premarket or intraday made each idea (reset
+  by premarket). An idea older than ``IDEA_MAX_AGE`` is never acted on.
 * ``recovery_error:<book>:<stop_id>`` and the guard's ``job_error:<job>:<type>:<date>``: once-only alerts.
 * ``recovery_plan:<book>:<stop_id>`` (text) and ``recovery_sent:<book>:<stop_id>`` (bool): the
   recovery plan is written once per stop and marked sent once the notifier took it.
@@ -21,7 +26,7 @@ import math
 import uuid
 from collections.abc import Iterable
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from aitrader.agents.llm import BudgetLevel, budget_level
@@ -30,7 +35,7 @@ from aitrader.agents.schemas import FundamentalView, NewsDigest, RecoveryPlan, T
 from aitrader.approvals import get_autopilot, set_autopilot
 from aitrader.calendar import IST
 from aitrader.data.market_data import is_stale
-from aitrader.execution import describe_error, marketable_limit
+from aitrader.execution import buy_stop_clear, describe_error, marketable_limit, slippage_pct
 from aitrader.models import Order, Quote, Side, TradeIdea
 from aitrader.risk.equity import book_equity
 from aitrader.risk.limits import LimitEval, LimitState
@@ -43,6 +48,10 @@ BENCH = "NIFTYBEES"
 LEARNING = "learning"
 LESSONS_FOR_PM = 10
 ACTED_KEY = "acted_ideas"
+CLOSED_KEY = "closed_ideas"
+IDEA_CREATED_KEY = "idea_created"
+IDEA_MAX_AGE = timedelta(hours=2)
+TODAYS_IDEAS_KEY = "todays_ideas"
 FUNDAMENTALS_KEY = "fundamentals"
 
 
@@ -293,8 +302,10 @@ def reanchor(svc: Any, idea: TradeIdea, quote: Quote) -> TradeIdea | None:
     Premarket limits are set against the previous close and may be outside the entry band by the
     time the idea is acted on. The new limit is a marketable one (``marketable_limit``): the edge of
     the entry band, because the paper broker adds slippage to the quote and a limit equal to the
-    quote would never fill. BUY: stop and target kept, ``stop < limit < target`` must still hold, and
-    ``expected_move_pct`` is capped at the new limit-to-target distance. SELL: only for a symbol some
+    quote would never fill. BUY: stop and target kept, ``stop < limit < target`` must still hold, the
+    stop must be below the quote less the broker's slippage (``buy_stop_clear``: else the entry sits at
+    or below its stop from the start), and ``expected_move_pct`` is capped at the new limit-to-target
+    distance. SELL: only for a symbol some
     book holds. The adjusted idea is persisted so the card, the sizing, the risk cost rule and the
     review all see one version.
     """
@@ -304,6 +315,10 @@ def reanchor(svc: Any, idea: TradeIdea, quote: Quote) -> TradeIdea | None:
         if not idea.stop < limit < idea.target:
             log.info("%s: price already beyond stop/target at open (price %.2f, limit %.2f, stop %.2f, "
                      "target %.2f); idea skipped", idea.symbol, quote.price, limit, idea.stop, idea.target)
+            return None
+        if not buy_stop_clear(idea.stop, quote.price, slippage_pct(svc)):
+            log.info("%s: price %.2f is at or below the stop %.2f once slippage is allowed for; idea skipped",
+                     idea.symbol, quote.price, idea.stop)
             return None
         move = min(idea.expected_move_pct, (idea.target - limit) / limit * 100)
         adjusted = replace(idea, limit_price=limit, expected_move_pct=move)
@@ -341,8 +356,13 @@ async def _act_on_ideas(svc: Any, ideas: list[TradeIdea], now: datetime) -> None
     autopilot = get_autopilot(store)                      # read after check_limits: a stop turns it off
     acted = list(store.get_state(ACTED_KEY) or [])
     acted_pairs = acted_symbol_sides(store, acted)
+    closed = set(store.get_state(CLOSED_KEY) or [])
     for idea in ideas:
-        if idea.id in acted:
+        if idea.id in acted or idea.id in closed:
+            continue
+        if idea_too_old(store, idea.id, now):
+            log.info("%s %s: idea %s is more than %s old; skipped", idea.side, idea.symbol, idea.id,
+                     IDEA_MAX_AGE)
             continue
         if (idea.symbol, str(idea.side)) in acted_pairs:
             log.info("%s %s was already acted on today; idea %s skipped", idea.side, idea.symbol, idea.id)
@@ -381,8 +401,39 @@ def acted_symbol_sides(store: Any, acted: list[str]) -> set[tuple[str, str]]:
 
 
 def unacted_ideas(svc: Any, ideas: list[TradeIdea]) -> list[TradeIdea]:
-    acted = set(svc.store.get_state(ACTED_KEY) or [])
-    return [i for i in ideas if i.id not in acted]
+    done = set(svc.store.get_state(ACTED_KEY) or []) | set(svc.store.get_state(CLOSED_KEY) or [])
+    return [i for i in ideas if i.id not in done]
+
+
+def record_ideas_created(store: Any, ideas: Iterable[TradeIdea], now: datetime) -> None:
+    """Remember when each idea was made (``idea_created``), for the ``IDEA_MAX_AGE`` rule."""
+    created = dict(store.get_state(IDEA_CREATED_KEY) or {})
+    created.update({i.id: now.isoformat() for i in ideas})
+    store.set_state(IDEA_CREATED_KEY, created)
+
+
+def idea_too_old(store: Any, idea_id: str, now: datetime) -> bool:
+    """True when the idea was made more than ``IDEA_MAX_AGE`` before ``now``. An idea with no (or an
+    unreadable) creation time is not judged by age."""
+    raw = (store.get_state(IDEA_CREATED_KEY) or {}).get(idea_id)
+    try:
+        created = datetime.fromisoformat(str(raw)) if raw else None
+    except ValueError:
+        return False
+    if created is None or created.tzinfo is None:
+        return False
+    return now - created > IDEA_MAX_AGE
+
+
+def close_open_ideas(store: Any) -> int:
+    """Close today's ideas that were not acted on yet (``closed_ideas``), so a later /resume never
+    acts on a thesis from hours earlier. Returns how many were closed."""
+    done = set(store.get_state(ACTED_KEY) or [])
+    closed = list(store.get_state(CLOSED_KEY) or [])
+    new = [i for i in store.get_state(TODAYS_IDEAS_KEY) or [] if i not in done and i not in closed]
+    if new:
+        store.set_state(CLOSED_KEY, closed + new)
+    return len(new)
 
 
 async def _submit(svc: Any, idea: TradeIdea, sizes: dict[str, int], quote: Quote, now: datetime) -> None:

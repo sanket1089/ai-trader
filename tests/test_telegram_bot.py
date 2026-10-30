@@ -1,5 +1,6 @@
 import logging
 import sqlite3
+import threading
 from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
@@ -17,7 +18,7 @@ from aitrader.approvals import ApprovalBook, get_autopilot
 from aitrader.calendar import at
 from aitrader.config import load_settings
 from aitrader.control import COMMAND_NAMES
-from aitrader.models import Order, Side, TradeIdea
+from aitrader.models import Order, Position, Side, TradeIdea
 from aitrader.risk.limits import LimitState, LossLimits
 from aitrader.store import Store
 from aitrader.telegram_bot import TelegramNotifier, _chunks, build_application
@@ -271,6 +272,26 @@ async def test_owner_stop_command_sets_the_kill_switch(app, bot, svc):
     assert svc.store.get_state("manual_stop") is True
     assert svc.executor.cancelled == ["e1"]
     assert "STOP" in bot.of("send")[0]["text"]
+
+
+async def test_owner_resume_fetches_its_quotes_in_a_thread(app, bot, svc):
+    hard_stop(svc)
+    svc.store.upsert_position(Position(book=REAL, symbol=SYMBOL, qty=1, avg_price=280.0, stop=270.0,
+                                       target=300.0, opened_at=NOW - timedelta(days=1), idea_id="i1"))
+    svc.store.set_state("recovery_approved:realistic:0", True)
+    loop_thread = threading.get_ident()
+    threads: list[int] = []
+    real_quotes = svc.market_data.quotes
+
+    def quotes(symbols):
+        threads.append(threading.get_ident())
+        return real_quotes(symbols)
+
+    svc.market_data.quotes = quotes
+    await dispatch(app, message_update(bot, "/resume"))
+
+    assert threads and all(t != loop_thread for t in threads)
+    assert "hard stop lifted" in bot.of("send")[0]["text"]
 
 
 async def test_long_replies_are_split_under_the_telegram_limit(app, bot, svc):

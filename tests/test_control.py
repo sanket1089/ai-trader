@@ -1,5 +1,7 @@
 import asyncio
 import sqlite3
+import threading
+import time
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -13,7 +15,7 @@ from aitrader.broker import PaperBroker
 from aitrader.calendar import at
 from aitrader.config import load_settings
 from aitrader.control import (CardResult, approve_recovery, handle_card, handle_card_tap, handle_command,
-                              handle_recovery, pending_recovery)
+                              handle_command_async, handle_recovery, pending_recovery)
 from aitrader.execution import Executor
 from aitrader.models import Order, OrderStatus, Position, Quote, Side, TradeIdea
 from aitrader.risk.equity import book_equity
@@ -745,3 +747,124 @@ async def test_card_refuses_to_approve_without_its_idea(svc, db_path):
 
     assert "idea behind this card is missing" in reply
     assert spy.calls == [] and svc.approvals.get(card.id).status == "open"
+
+
+# ---------------------------------------------------------------- final-review fixes
+
+
+async def test_dry_run_approval_stop_and_expiry_never_tick_the_go_live_flags(svc):
+    svc.dry_run = True
+    svc.executor = SpyExecutor()
+    approved = new_card(svc)
+    expiring = new_card(svc, idea=make_idea(id="i2"))
+
+    await handle_card(approved.id, True, svc, NOW)
+    await handle_card(expiring.id, True, svc, NOW + timedelta(minutes=11))
+    svc.executor.cancel_order = lambda order_id, why: True
+    run(svc, "stop")
+
+    assert svc.approvals.get(approved.id).status == "approved"
+    for key in ("tested_approval", "tested_stop", "tested_expiry"):
+        assert svc.store.get_state(key) is None, key
+    assert svc.store.get_state("manual_stop") is True                      # the stop itself still works
+
+
+async def test_card_approve_at_or_below_the_stop_places_nothing_and_closes_the_card(svc):
+    svc.executor = spy = SpyExecutor()
+    idea = TradeIdea(id="low", symbol=SYMBOL, side=Side.BUY, limit_price=100.5, stop=100.2, target=110.0,
+                     expected_move_pct=9.0, confidence=0.7, holding_days=5, reason="trend is up")
+    card = new_card(svc, quote=100.0, idea=idea)
+    svc.market_data.set(SYMBOL, 100.0, NOW - timedelta(minutes=1))     # stop 100.2 >= 100 x (1 - 0.3%)
+
+    result = await handle_card_tap(card.id, True, svc, NOW)
+
+    assert "at or below the stop" in result.text and "nothing was ordered" in result.text
+    assert result.still_open is False                                    # the buttons are removed
+    assert spy.calls == []
+    assert svc.approvals.get(card.id).status == "rejected"
+    assert svc.store.get_state("tested_approval") is None
+
+
+async def test_card_approve_with_the_stop_clear_of_slippage_still_places(svc):
+    svc.executor = spy = SpyExecutor()
+    idea = TradeIdea(id="ok", symbol=SYMBOL, side=Side.BUY, limit_price=100.5, stop=99.6, target=110.0,
+                     expected_move_pct=9.0, confidence=0.7, holding_days=5, reason="trend is up")
+    card = new_card(svc, quote=100.0, idea=idea)
+    svc.market_data.set(SYMBOL, 100.0, NOW - timedelta(minutes=1))     # 99.6 < 99.7
+
+    await handle_card_tap(card.id, True, svc, NOW)
+
+    assert len(spy.calls) == 2
+
+
+async def test_stop_expires_open_cards_so_a_sell_card_cannot_be_approved_after_it(svc):
+    hold(svc)
+    sell = TradeIdea(id="s1", symbol=SYMBOL, side=Side.SELL, limit_price=279.0, stop=270.0, target=300.0,
+                     expected_move_pct=0.0, confidence=0.7, holding_days=0, reason="take profit")
+    card = new_card(svc, sizes={REAL: 3}, idea=sell)
+
+    reply = run(svc, "stop")
+    assert "Closed 1 open approval card(s)" in reply
+    assert svc.approvals.get(card.id).status == "expired"
+
+    result = await handle_card_tap(card.id, True, svc, NOW + timedelta(minutes=1))
+
+    assert "expired" in result.text and result.still_open is False
+    assert svc.store.pending_orders() == [] and svc.store.positions(REAL)[0].qty == 3
+    assert svc.store.get_state("tested_expiry") is None                  # closed by /stop, not by time
+
+
+@pytest.mark.parametrize("cmd", ["pause", "stop"])
+def test_pause_and_stop_close_todays_unacted_ideas(svc, cmd):
+    svc.store.set_state("todays_ideas", ["a", "b", "c"])
+    svc.store.set_state("acted_ideas", ["a"])
+
+    reply = run(svc, cmd)
+
+    assert svc.store.get_state("closed_ideas") == ["b", "c"]
+    assert svc.store.get_state("acted_ideas") == ["a"]                   # a closed idea is not "acted"
+    assert "Closed 2 idea(s)" in reply
+
+
+async def test_resume_fetches_its_quotes_off_the_event_loop(svc):
+    hold(svc, qty=2)
+    svc.store.set_cash(REAL, 100.0)
+    svc.market_data.set(SYMBOL, 200.0, NOW)
+    equity = book_equity(svc.store, REAL, {SYMBOL: Quote(SYMBOL, 200.0, NOW)}, SETTINGS.charges)
+    hard_stop(svc, equity=equity)
+    svc.store.set_state("recovery_approved:realistic:0", True)
+
+    loop_thread = threading.get_ident()
+    feed_threads: list[int] = []
+    real_quotes = svc.market_data.quotes
+
+    def slow_quotes(symbols):
+        feed_threads.append(threading.get_ident())
+        time.sleep(0.3)                                                   # a slow, blocking feed
+        return real_quotes(symbols)
+
+    svc.market_data.quotes = slow_quotes
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        for _ in range(10):
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    task = asyncio.create_task(handle_command_async("resume", [], svc, NOW))
+    await ticker()
+    ticked_while_fetching = ticks == 10 and not task.done()
+    reply = await task
+
+    assert feed_threads and all(t != loop_thread for t in feed_threads)
+    assert ticked_while_fetching                                          # the loop kept running meanwhile
+    assert "hard stop lifted" in reply
+    assert svc.limits[REAL].baseline() == pytest.approx(equity)
+
+
+async def test_resume_async_without_a_resumable_book_fetches_nothing(svc):
+    svc.store.set_state("paused", True)
+    reply = await handle_command_async("resume", [], svc, NOW)
+    assert "cleared the pause" in reply and svc.market_data.calls == []
+    assert await handle_command_async("/budget", [], svc, NOW) == handle_command("budget", [], svc, NOW)

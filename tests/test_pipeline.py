@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from dataclasses import replace
 from datetime import date, timedelta
 
 import pytest
@@ -21,7 +22,9 @@ from aitrader.agents.schemas import (
 from aitrader.approvals import get_autopilot, set_autopilot
 from aitrader.calendar import at
 from aitrader.charges import compute_charges
-from aitrader.models import Fill, Order, Position, Side, TradeIdea
+from aitrader.control import handle_command
+from aitrader.models import Fill, Order, Position, Quote, Side, TradeIdea
+from aitrader.pipeline_support import reanchor, record_ideas_created
 from aitrader.risk.limits import LimitState
 from aitrader.risk.manager import MANUAL_STOP_KEY, PAUSED_KEY
 
@@ -568,6 +571,103 @@ async def test_recovery_plan_error_never_aborts_entries(tmp_path):
     alerts = [t for t in svc.notifier.texts if "recovery plan could not be written" in t]
     assert len(alerts) == 1 and "secret" not in alerts[0]
     assert svc.notifier.recoveries == []
+
+
+# ---------------------------------------------------------------- final-review fixes
+
+def test_reanchor_skips_a_buy_whose_stop_is_within_slippage_of_the_price(tmp_path):
+    now = at(MON, "09:20")
+    svc = make_svc(tmp_path, md_at(now), now=now)
+    idea = TradeIdea(id="x", symbol="NIFTYBEES", side=Side.BUY, limit_price=100.0, stop=100.2, target=110.0,
+                     expected_move_pct=10.0, confidence=0.7, holding_days=5, reason="breakout")
+    quote = Quote("NIFTYBEES", 100.0, now)
+    assert reanchor(svc, idea, quote) is None                        # 100.2 >= 100 x (1 - 0.3%) = 99.7
+    assert svc.store.get_idea("x") is None                           # nothing saved for a skipped idea
+    assert reanchor(svc, replace(idea, stop=99.6), quote) is not None
+
+
+async def test_pause_then_resume_does_not_revive_the_morning_idea(tmp_path):
+    pre = at(MON, "08:30")
+    svc = make_svc(tmp_path, md_at(pre), full_llm(), now=pre)
+    await pipeline.premarket(svc, pre)
+    assert len(svc.store.get_state("todays_ideas")) == 1
+
+    handle_command("pause", [], svc, at(MON, "09:00"))
+    open_ = at(MON, "09:20")
+    svc.market_data.ts = open_ - timedelta(minutes=16)
+    await pipeline.open_session(svc, open_)                          # paused: nothing acted
+    handle_command("resume", [], svc, at(MON, "09:30"))
+    later = at(MON, "09:41")
+    svc.market_data.ts = later - timedelta(minutes=16)
+    await pipeline.exits_job(svc, later)
+
+    assert svc.notifier.cards == [] and svc.executor.submits == []
+
+
+@pytest.mark.parametrize("age, acted", [(timedelta(hours=2, minutes=1), False),
+                                        (timedelta(hours=1, minutes=59), True)])
+async def test_an_idea_older_than_two_hours_is_skipped(tmp_path, age, acted):
+    now = at(MON, "11:00")
+    svc = make_svc(tmp_path, md_at(now), now=now)
+    idea = nifty_idea()
+    stage_ideas(svc, [idea])
+    record_ideas_created(svc.store, [idea], now - age)
+    await pipeline.exits_job(svc, now)
+    assert (len(svc.notifier.cards) == 1) is acted
+
+
+async def test_data_down_premarket_resets_yesterdays_acted_ideas(tmp_path):
+    now = at(MON, "08:30")
+    svc = make_svc(tmp_path, md_at(now, prices={}), full_llm(), now=now)
+    svc.store.save_idea(nifty_idea(id="yday"))
+    svc.store.set_state("acted_ideas", ["yday"])                     # yesterday's NIFTYBEES BUY
+
+    await pipeline.premarket(svc, now)
+    assert svc.store.get_state("acted_ideas") == []
+
+    later = at(MON, "10:00")
+    svc.market_data = md_at(later)                                   # the feed is back
+    stage_ideas(svc, [nifty_idea(id="today")])
+    await pipeline.exits_job(svc, later)
+    assert len(svc.notifier.cards) == 1
+
+
+@pytest.mark.parametrize("key", [PAUSED_KEY, MANUAL_STOP_KEY])
+async def test_intraday_makes_no_ai_call_while_entries_are_blocked(tmp_path, key):
+    now = at(MON, "11:20")
+    llm = full_llm()
+    svc = make_svc(tmp_path, md_at(now), llm, now=now)
+    svc.store.set_state("premarket_prices", {"NIFTYBEES": 250.0})      # a >2% move: the trigger would fire
+    svc.store.set_state("shortlist", ["NIFTYBEES"])
+    svc.store.set_state(key, True)
+
+    await pipeline.intraday(svc, now)
+
+    assert llm.calls == []
+    assert len(svc.executor.retries) == 1                            # pending orders still retried
+
+
+async def test_intraday_makes_no_ai_call_when_no_book_is_active(tmp_path):
+    now = at(MON, "11:20")
+    llm = full_llm()
+    svc = make_svc(tmp_path, md_at(now), llm, now=now)
+    svc.store.set_cash(REAL, 850.0)                                   # both books past their daily limit
+    svc.store.set_cash(LEARN, 85000.0)
+    svc.store.set_state("premarket_prices", {"NIFTYBEES": 250.0})
+    svc.store.set_state("shortlist", ["NIFTYBEES"])
+
+    await pipeline.intraday(svc, now)
+
+    assert {svc.limits[b].state(now) for b in (REAL, LEARN)} == {LimitState.DAILY_PAUSED}
+    assert llm.calls == []
+
+
+async def test_postmarket_dry_run_never_seeds_the_benchmark(tmp_path):
+    now = at(MON, "15:45")
+    svc = make_svc(tmp_path, md_at(now), full_llm(), now=now)
+    svc.dry_run = True
+    await pipeline.postmarket(svc, now)
+    assert svc.store.get_state("bench_start") is None
 
 # ---------------------------------------------------------------- weekly
 

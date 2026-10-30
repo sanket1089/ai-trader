@@ -10,6 +10,7 @@ Life of a card::
          --reject---> rejected
          --approve--> expired + REISSUE (price moved, or can't be confirmed: caller issues a new card)
          --time-----> expired           (resolve or expire_due, from ``expires_at`` on)
+         --/stop----> expired           (expire_all_open: the owner's kill switch)
 
 ``resolve`` does its read, check and write inside one store transaction, so a double tap, or two
 taps at the same moment, resolve the card exactly once; the loser gets ``ALREADY_RESOLVED``.
@@ -209,6 +210,13 @@ class ApprovalBook:
                 if now >= card.expires_at:
                     expired.append(self._set_status(card, "expired"))
         return expired
+
+    def expire_all_open(self, now: datetime) -> list[ApprovalCard]:
+        """Close every open card as expired, whatever its time (the owner's /stop). A later tap on
+        one gets ``EXPIRED`` and places nothing. Returns those cards, oldest first."""
+        _require_aware(now, "now")
+        with self._store.transaction():
+            return [self._set_status(_from_payload(p), "expired") for p in self._store.cards_with_status("open")]
 
     def render(self, card: ApprovalCard, idea: TradeIdea, charges_cfg: ChargesConfig) -> str:
         """Plain text for the Telegram card (the adapter sends no parse mode).

@@ -85,6 +85,22 @@ def marketable_limit(side: Side, price: float, band_pct: float) -> float:
     return (math.floor(exact) if side == Side.BUY else math.ceil(exact)) / 100
 
 
+DEFAULT_SLIPPAGE_PCT = 0.30      # PaperBroker's default; used when no broker exposes ``slippage_pct``
+
+
+def buy_stop_clear(stop: float, price: float, slippage_pct: float = DEFAULT_SLIPPAGE_PCT) -> bool:
+    """True when a BUY's ``stop`` is below ``price`` less the broker's slippage. An entry whose stop
+    is at or above ``price x (1 - slippage)`` sits at or below its stop from the start, so it is not
+    placed."""
+    return stop < price * (1 - slippage_pct / 100)
+
+
+def slippage_pct(svc: object) -> float:
+    """The paper broker's slippage in percent (``svc.broker.slippage_pct``), else the default."""
+    value = getattr(getattr(svc, "broker", None), "slippage_pct", None)
+    return float(value) if isinstance(value, int | float) and not isinstance(value, bool) else DEFAULT_SLIPPAGE_PCT
+
+
 def _ist_day(now: datetime) -> date:
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")

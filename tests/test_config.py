@@ -44,6 +44,12 @@ def test_load_settings_reads_yaml_and_env(config_path):
     assert s.telegram_bot_token.get_secret_value() == SECRET_TOKEN
 
 
+@pytest.mark.parametrize("model", ["claude-opus-5", "claude-opus-4-8"])
+def test_fallback_models_have_price_rows(config_path, model):
+    price = load_settings(config_path, env=ENV).ai.prices[model]
+    assert (price.input, price.output, price.cache_read, price.cache_write) == (5, 25, 0.50, 6.25)
+
+
 def test_repo_config_values_from_global_constraints(config_path):
     s = load_settings(config_path, env=ENV)
     assert s.risk.entry_band_pct == 0.5

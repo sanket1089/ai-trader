@@ -1,5 +1,8 @@
 """Command line: ``py -m aitrader run [--dry-run] [--config config.yaml]`` and ``py -m aitrader check-config``.
 
+``run --dry-run`` uses its own database, ``dryrun.db`` next to ``db_path``; the database in use is
+printed at startup.
+
 Secrets come from ``.env`` next to the config file (or the real environment) and are never printed.
 """
 
@@ -45,6 +48,18 @@ def _load(config_path: Path) -> Settings | None:
     return settings
 
 
+DRY_RUN_DB_NAME = "dryrun.db"
+
+
+def settings_for_run(settings: Settings, dry_run: bool) -> Settings:
+    """A dry run gets its own database, ``dryrun.db`` next to ``db_path``: it must never seed the
+    Phase 1 start or the benchmark, tick the go-live flags, or write snapshots, lessons or orders
+    into the real paper-trading database."""
+    if not dry_run:
+        return settings
+    return settings.model_copy(update={"db_path": settings.db_path.parent / DRY_RUN_DB_NAME})
+
+
 def check_config(config_path: Path) -> int:
     settings = _load(config_path)
     if settings is None:
@@ -77,6 +92,9 @@ def run(config_path: Path, dry_run: bool) -> int:
     settings = _load(config_path)
     if settings is None:
         return 2
+    settings = settings_for_run(settings, dry_run)
+    print(f"Database: {settings.db_path}"
+          + (" (dry run: its own database; the paper-trading database is not touched)" if dry_run else ""))
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print(f"ANTHROPIC_API_KEY is not set in {config_path.parent / '.env'} or the environment.")
         return 2

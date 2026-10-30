@@ -29,7 +29,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
 from aitrader.approvals import ApprovalCard
 from aitrader.calendar import now_ist
 from aitrader.control import (COMMAND_NAMES, CardResult, handle_card_tap, handle_command,
-                              handle_recovery)
+                              handle_command_async, handle_recovery)
 from aitrader.execution import describe_error
 
 log = logging.getLogger(__name__)
@@ -38,7 +38,8 @@ TEXT_LIMIT = 4000        # Telegram refuses a text above 4096 characters
 
 # Commands that read quotes from the (blocking) market data feed run in a thread so they do not
 # freeze the bot. The ones that change state (/stop, /pause, /resume, /autopilot) run inline: with no
-# await in them, nothing else on the event loop can place an order halfway through.
+# await in them, nothing else on the event loop can place an order halfway through. /resume needs
+# quotes too: ``handle_command_async`` fetches them in a thread first, then runs it inline.
 _THREADED = frozenset({"status", "positions", "pnl"})
 
 _CARD_PATTERN = r"^(approve|reject):"
@@ -143,7 +144,7 @@ def build_application(svc: Any, clock: Callable[[], datetime] = now_ist) -> Appl
             if name in _THREADED:
                 reply = await asyncio.to_thread(handle_command, name, args, svc, clock())
             else:
-                reply = handle_command(name, args, svc, clock())
+                reply = await handle_command_async(name, args, svc, clock())
             for chunk in _chunks(reply):
                 await update.effective_message.reply_text(chunk)
         return on_command
