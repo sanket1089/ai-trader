@@ -1,7 +1,7 @@
 """RSS news fetch and the cheap code-level pre-filter that runs before any AI call.
 
-Failure policy: a feed that raises or cannot be parsed is skipped with a warning; one bad feed
-never costs the others. An item without a parseable date is dropped (debug log), never dated
+Failure policy: a feed that raises, cannot be parsed or answers with an HTTP error status is
+skipped with a warning; one bad feed never costs the others. An item without a parseable date is dropped (debug log), never dated
 "now" by guesswork, so it can't slip past the ``since`` cutoff.
 """
 
@@ -17,7 +17,9 @@ from aitrader.calendar import IST
 
 log = logging.getLogger(__name__)
 
-_TAG_RE = re.compile(r"<[^>]*>")
+# Only tag-shaped things: "<" followed by a letter, "/" + letter, or "!" (comments, doctype).
+# A bare "<" or ">" in a headline ("Sensex <80,000 but Nifty >25,000") is real text.
+_TAG_RE = re.compile(r"</?[A-Za-z!][^>]*>")
 _SPACE_RE = re.compile(r"\s+")
 
 
@@ -91,9 +93,17 @@ def fetch_news(feeds: list[str], since: datetime, parse=feedparser.parse) -> lis
         except Exception as exc:
             log.warning("news feed %s failed: %s", url, exc)
             continue
+        # feedparser does not raise on HTTP errors: a 5xx with an empty body comes back as
+        # status=503, bozo=0, entries=[]. ``status`` is absent for local parses and fakes.
+        status = parsed.get("status")
+        if isinstance(status, int) and status >= 400:
+            log.warning("news feed %s returned HTTP %d; skipping", url, status)
+            continue
         if parsed.get("bozo") and not parsed.get("entries"):
             log.warning("news feed %s could not be parsed: %s", url, parsed.get("bozo_exception"))
             continue
+        if not parsed.get("entries"):
+            log.debug("news feed %s has no entries", url)  # a quiet feed is legitimate
         for item in _items_from_feed(url, parsed):
             if item.published < since or item.link in seen:
                 continue

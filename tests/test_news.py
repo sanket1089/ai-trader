@@ -22,8 +22,11 @@ def entry(title, link, parsed=None, summary="", key="published_parsed"):
     return e
 
 
-def feed(entries, title="Fake Feed", bozo=0):
-    return {"feed": {"title": title}, "entries": entries, "bozo": bozo}
+def feed(entries, title="Fake Feed", bozo=0, status=None):
+    parsed = {"feed": {"title": title}, "entries": entries, "bozo": bozo}
+    if status is not None:
+        parsed["status"] = status  # absent on local parses and fakes; feedparser sets it for HTTP fetches
+    return parsed
 
 
 def fake_parse(by_url):
@@ -136,6 +139,33 @@ def test_failing_feed_skipped(caplog):
     assert "bozo" in caplog.text
 
 
+def test_http_error_status_feed_skipped_with_warning(caplog):
+    # feedparser reports an HTTP 5xx with an empty body as status=503, bozo=0, entries=[]: no exception
+    by_url = {
+        "https://feeds/down": feed([], status=503),
+        "https://feeds/gone": feed([], status=404),
+        "https://feeds/good": feed([entry("Ok", "https://x/ok", utc_struct(2026, 10, 30, 5, 0))], status=200),
+    }
+    with caplog.at_level(logging.DEBUG):
+        items = fetch_news(list(by_url), SINCE, parse=fake_parse(by_url))
+
+    assert [i.link for i in items] == ["https://x/ok"]
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert any("https://feeds/down" in r.getMessage() and "503" in r.getMessage() for r in warnings)
+    assert any("https://feeds/gone" in r.getMessage() and "404" in r.getMessage() for r in warnings)
+    assert not any("https://feeds/good" in r.getMessage() for r in warnings)
+
+
+def test_empty_200_feed_is_legitimate_and_not_warned(caplog):
+    by_url = {"https://feeds/quiet": feed([], status=200), "https://feeds/local": feed([])}  # no status key
+    with caplog.at_level(logging.DEBUG):
+        assert fetch_news(list(by_url), SINCE, parse=fake_parse(by_url)) == []
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert "https://feeds/quiet" in caplog.text  # noted at debug level only
+
+
 def test_bozo_feed_with_entries_is_kept():
     by_url = {"f": feed([entry("Ok", "https://x/ok", utc_struct(2026, 10, 30, 5, 0))], bozo=1)}
     assert len(fetch_news(["f"], SINCE, parse=fake_parse(by_url))) == 1
@@ -145,6 +175,34 @@ def test_fetch_news_source_falls_back_to_feed_url():
     by_url = {"https://feeds/x": {"feed": {}, "entries": [entry("T", "https://x/t", utc_struct(2026, 10, 30, 5, 0))]}}
     items = fetch_news(["https://feeds/x"], SINCE, parse=fake_parse(by_url))
     assert items[0].source == "https://feeds/x"
+
+
+def test_text_keeps_angle_brackets_that_are_not_tags():
+    by_url = {
+        "f": feed(
+            [
+                entry(
+                    "Sensex <80,000 but Nifty >25,000 holds",
+                    "https://x/num",
+                    utc_struct(2026, 10, 30, 5, 0),
+                    summary="<b>bold</b> text",
+                ),
+                entry(
+                    "Rupee <b>weakens</b> past 88",
+                    "https://x/tag",
+                    utc_struct(2026, 10, 30, 4, 0),
+                    summary="<p>Line one</p><br/><!-- note -->two &lt;3",
+                ),
+            ]
+        )
+    }
+
+    items = {i.link: i for i in fetch_news(["f"], SINCE, parse=fake_parse(by_url))}
+
+    assert items["https://x/num"].title == "Sensex <80,000 but Nifty >25,000 holds"
+    assert items["https://x/num"].summary == "bold text"
+    assert items["https://x/tag"].title == "Rupee weakens past 88"
+    assert items["https://x/tag"].summary == "Line one two <3"
 
 
 # --------------------------------------------------------------------------- prefilter
