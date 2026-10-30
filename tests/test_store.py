@@ -168,6 +168,14 @@ def test_update_order_persists_status_attempts_and_price(tmp_path):
     assert rows == [("FILLED", 2, 281.5)]
 
 
+def test_get_order_returns_any_status_with_enums_or_none_when_missing(store):
+    store.save_order(order("o1", side=Side.SELL, is_exit=True, status=OrderStatus.FILLED, idea_id=None))
+    o = store.get_order("o1")
+    assert o == order("o1", side=Side.SELL, is_exit=True, status=OrderStatus.FILLED, idea_id=None)
+    assert o.side is Side.SELL and o.status is OrderStatus.FILLED and o.idea_id is None
+    assert store.get_order("missing") is None
+
+
 def test_update_order_unknown_id_raises(store):
     with pytest.raises(KeyError):
         store.update_order(order("missing"))

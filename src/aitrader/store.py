@@ -274,6 +274,11 @@ class Store:
         if cur.rowcount == 0:
             raise KeyError(f"no such order: {o.id}")
 
+    def get_order(self, order_id: str) -> Order | None:
+        """The order with this id in any status, or ``None``."""
+        rows = self._read("SELECT * FROM orders WHERE id = ?", (order_id,))
+        return _order(rows[0]) if rows else None
+
     def pending_orders(self, book: str | None = None) -> list[Order]:
         sql = "SELECT * FROM orders WHERE status = ?"
         params: tuple = (str(OrderStatus.PENDING),)

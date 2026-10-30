@@ -81,3 +81,7 @@ class TradeReview(BaseModel):
 class ReviewOutput(BaseModel):
     lessons: list[str]
     trade_reviews: list[TradeReview]
+
+
+class WeeklyNotes(BaseModel):
+    notes: str
