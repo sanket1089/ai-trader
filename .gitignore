@@ -5,3 +5,5 @@ data/cache/
 __pycache__/
 *.egg-info/
 .pytest_cache/
+*.db-wal
+*.db-shm
