@@ -19,8 +19,10 @@ charges and slippage. You talk to the bot on Telegram.
   again only if something moved more than 2% or important news came in.
 - **Every 3 minutes (09:15 to 15:30)** it checks each holding's stop and target and sells
   automatically when one is hit. This happens whatever the autopilot setting is.
-- **After the close (15:45)** it marks the books at the official closing prices, has the AI review
-  the day and write lessons, and sends you the daily summary.
+- **After the close (15:45)** it marks the books at the day's closing prices, has the AI review the
+  day and write lessons, and sends you the daily summary. NSE often publishes its official closing
+  prices (the bhavcopy) hours after 15:45, so the evening summary usually uses Yahoo's daily close
+  instead.
 - **Saturday 10:00**: the weekly review and the go-live checklist.
 
 ## What it does not do
@@ -61,13 +63,8 @@ py -3 -m venv .venv
    .venv\Scripts\python -m aitrader check-config
    ```
    It prints the books, the schedule and how many holidays are configured.
-2. Run one full day in **dry-run** mode. It uses real data and real AI calls, but places no orders at
-   all, not even paper ones:
-   ```
-   .venv\Scripts\python -m aitrader run --dry-run
-   ```
-   To see just one morning without starting the bot, run the simulator. It does the 08:30 premarket and
-   the 09:20 open session **once** with real data and the real Claude API, places no orders and sends
+2. See one morning without starting the bot: run the simulator. It does the 08:30 premarket and the
+   09:20 open session **once** with real data and the real Claude API, places no orders and sends
    nothing to Telegram, and prints the news digest, the shortlist, the AI's ideas with their reasons, the
    approval cards you would have received, and what the run cost in AI spend (about US$1-3, so it needs
    `ANTHROPIC_API_KEY` in `.env`; without it the script says so and stops):
@@ -76,12 +73,22 @@ py -3 -m venv .venv
    ```
    Cards appear only while quotes are fresh: run it on a trading day between about 09:30 and 15:10 IST.
    It uses its own database, `data/simulate.db` (recreated on every run), never the real one.
-3. Then run it for real (paper trading):
+3. Optional: run the whole bot for a day in **dry-run** mode. It uses real data, real AI calls and
+   Telegram, but places no orders at all, not even paper ones:
+   ```
+   .venv\Scripts\python -m aitrader run --dry-run
+   ```
+   A dry run uses its own database, `data/dryrun.db`, so it never starts the Phase 1 clock, ticks a
+   go-live box or writes into the real paper-trading database. The database in use is printed at startup.
+4. Then run it for real (paper trading):
    ```
    .venv\Scripts\python -m aitrader run
    ```
    Keep the window open. Stop it with Ctrl+C. It is safe to restart: cash, positions and limits are
    kept in `data/aitrader.db`.
+
+**Every December:** add next year's NSE trading holidays to the `holidays` list in `config.yaml`
+(see "Good to know" below).
 
 ## Telegram commands
 
@@ -92,15 +99,17 @@ py -3 -m venv .venv
 | `/positions` | Holdings and waiting orders per book |
 | `/pnl` | Equity and profit/loss per book, and AI spend this month |
 | `/journal [n]` | The latest lessons the reviewer wrote (default 5, up to 20) |
-| `/pause` | No new entries and no AI sell ideas in any book. Automatic stop/target exits still work. |
-| `/resume` | Lift a pause or stop. A hard-stopped book restarts only after you approve its recovery plan. |
-| `/stop` | Kill switch: cancels waiting entry orders, blocks new ones and turns autopilot off |
+| `/pause` | No new entries and no AI sell ideas in any book; today's ideas not acted on yet are dropped. Automatic stop/target exits still work. |
+| `/resume` | Lift a pause or stop. A hard-stopped book restarts only after you approve its recovery plan. Ideas dropped by `/pause` or `/stop` stay dropped. |
+| `/stop` | Kill switch: cancels waiting entry orders, closes open approval cards, drops today's ideas not acted on yet, blocks new entries and turns autopilot off |
 | `/budget` | AI spend this month and today, in US$ and ₹ |
 | `/help` | The list of commands |
 
 **Approval cards** show the stock, buy or sell, units per book, the limit price, target, stop, the
 estimated charges and the reason. They expire after 10 minutes or at 15:10, whichever is first. If
-the price moved more than 0.5% by the time you tap ✅, you get a fresh card instead.
+the price moved more than 0.5% by the time you tap ✅, you get a fresh card instead. If a buy's
+price has fallen to its stop by then, nothing is placed and the card is closed. An idea is acted on
+for at most 2 hours after the AI made it.
 
 **Loss limits.** The realistic book pauses for the day after a ₹100 loss and stops completely after
 ₹500; the learning book after ₹10,000 / ₹50,000. After a complete (hard) stop the AI sends one
