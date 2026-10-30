@@ -12,8 +12,8 @@ from aitrader.approvals import ApprovalBook, get_autopilot, set_autopilot
 from aitrader.broker import PaperBroker
 from aitrader.calendar import at
 from aitrader.config import load_settings
-from aitrader.control import (approve_recovery, handle_card, handle_command, handle_recovery,
-                              pending_recovery)
+from aitrader.control import (CardResult, approve_recovery, handle_card, handle_card_tap, handle_command,
+                              handle_recovery, pending_recovery)
 from aitrader.execution import Executor
 from aitrader.models import Order, OrderStatus, Position, Quote, Side, TradeIdea
 from aitrader.risk.equity import book_equity
@@ -210,12 +210,17 @@ def test_stop_survives_a_cancel_that_fails(svc):
     assert "Could not cancel" in reply and "secret-token-123" not in reply
 
 
-def test_stop_without_an_executor_cancel_still_cancels_in_the_store(svc):
+def test_stop_without_an_executor_cancel_fails_loudly_instead_of_faking_a_cancel(svc):
+    set_autopilot(svc.store, True)
     svc.store.save_order(order("e1"))
-    svc.executor = SimpleNamespace()
-    run(svc, "stop")
-    assert svc.store.get_order("e1").status is OrderStatus.CANCELLED
-    assert svc.store.get_order("e1").reason.endswith("cancelled: owner /stop")
+    svc.executor = SimpleNamespace()                                          # no cancel_order
+
+    reply = run(svc, "stop")
+
+    assert "/stop hit an internal error (ExecutorCannotCancel)" in reply     # the owner is told it failed
+    assert svc.store.get_order("e1").status is OrderStatus.PENDING            # not marked cancelled in the store
+    assert svc.store.get_state("manual_stop") is True                         # but nothing new can start
+    assert get_autopilot(svc.store) is False
 
 
 # ---------------------------------------------------------------- /pause and /resume
@@ -658,6 +663,51 @@ async def test_card_double_tap_places_the_orders_once(svc):
 
 async def test_card_unknown_id(svc):
     assert "unknown" in await handle_card("nope", True, svc, NOW)
+
+
+# ---------------------------------------------------------------- which taps leave the card open
+
+
+async def test_a_tap_with_no_price_leaves_the_card_open(svc):
+    card = new_card(svc)
+    svc.market_data.by_symbol.clear()
+
+    result = await handle_card_tap(card.id, True, svc, NOW)
+
+    assert isinstance(result, CardResult) and result.still_open is True
+    assert "tap again" in result.text
+
+
+async def test_a_tap_whose_idea_is_missing_leaves_the_card_open(svc, db_path):
+    card = new_card(svc)
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.execute("DELETE FROM ideas WHERE id = 'i1'")
+
+    result = await handle_card_tap(card.id, True, svc, NOW)
+
+    assert result.still_open is True and "idea behind this card is missing" in result.text
+
+
+async def test_every_tap_that_resolves_the_card_closes_it(svc):
+    svc.executor = SpyExecutor()
+    approved, rejected, expired, reissued = (new_card(svc) for _ in range(4))
+
+    results = {
+        "approved": await handle_card_tap(approved.id, True, svc, NOW),
+        "again": await handle_card_tap(approved.id, True, svc, NOW),                  # already handled
+        "rejected": await handle_card_tap(rejected.id, False, svc, NOW),
+        "expired": await handle_card_tap(expired.id, True, svc, NOW + timedelta(minutes=11)),
+        "unknown": await handle_card_tap("nope", True, svc, NOW),
+    }
+    svc.market_data.set(SYMBOL, 285.0, NOW)
+    results["reissued"] = await handle_card_tap(reissued.id, True, svc, NOW)
+
+    assert {name: r.still_open for name, r in results.items()} == dict.fromkeys(results, False)
+
+
+async def test_handle_card_returns_the_same_text_as_the_tap_result(svc):
+    card = new_card(svc)
+    assert await handle_card(card.id, False, svc, NOW) == "Rejected BUY NIFTYBEES. Nothing was ordered."
 
 
 async def test_card_refuses_to_approve_without_its_idea(svc, db_path):

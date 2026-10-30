@@ -1,15 +1,17 @@
 """Telegram adapter (python-telegram-bot v21+): carries text between the owner and ``control.py``.
 
-* Only the owner is served. Every handler checks the chat id (commands) or the user id (taps) against
-  ``settings.telegram_owner_chat_id``. Anyone else is logged by id only and gets no reply: a
-  stranger's callback query is answered with no text, so the button stops spinning, and nothing else.
+* Only the owner is served. Every command handler checks both the chat id and the user id, and every
+  tap checks the user id, against ``settings.telegram_owner_chat_id`` (which must be positive: no
+  group chats). Anyone else is logged by id only and gets no reply: a stranger's callback query is
+  answered with no text, so the button stops spinning, and nothing else.
 * Messages are plain text (no ``parse_mode``): lesson and idea text comes from a model and from news.
 * Secrets: the bot token is never logged. PTB's HTTP client (httpx) logs every request URL at INFO,
   and the URL holds the token, so ``build_application`` raises the httpx loggers to WARNING. The error
   handler logs only the error's type and place, never its message.
 * Cards: ``TelegramNotifier.send_card`` attaches the ✅ ``approve:<id>`` and ❌ ``reject:<id>``
   buttons. When a tap resolves the card, its message is edited to append the outcome and the keyboard
-  is removed (an edit without ``reply_markup`` drops the keyboard).
+  is removed (an edit without ``reply_markup`` drops the keyboard). When a tap leaves the card open
+  (no current price, an error) the reply is a new message and the card keeps its buttons.
 * Updates are handled one at a time (PTB's default), so two taps on one card never run together.
 """
 
@@ -26,7 +28,8 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
 
 from aitrader.approvals import ApprovalCard
 from aitrader.calendar import now_ist
-from aitrader.control import COMMAND_NAMES, handle_card, handle_command, handle_recovery
+from aitrader.control import (COMMAND_NAMES, CardResult, handle_card_tap, handle_command,
+                              handle_recovery)
 from aitrader.execution import describe_error
 
 log = logging.getLogger(__name__)
@@ -103,15 +106,22 @@ class TelegramNotifier:
 def build_application(svc: Any, clock: Callable[[], datetime] = now_ist) -> Application:
     """The PTB application for ``svc``. Building it makes no network call; ``run_polling`` does."""
     owner = svc.settings.telegram_owner_chat_id
+    if owner <= 0:
+        # Telegram group and channel ids are negative. The owner is one person in a private chat,
+        # where the chat id and the user id are the same number; groups are not supported.
+        raise ValueError("telegram_owner_chat_id must be the owner's positive private chat id; "
+                         "group chats are not supported")
     for noisy in ("httpx", "httpcore"):                           # their INFO lines carry the bot token
         logging.getLogger(noisy).setLevel(logging.WARNING)
     app = Application.builder().token(svc.settings.telegram_bot_token.get_secret_value()).build()
 
     def from_owner_chat(update: Update) -> bool:
-        chat = update.effective_chat
-        if chat is not None and chat.id == owner:
+        """True for a message in the owner's chat sent by the owner (both ids must match)."""
+        chat, user = update.effective_chat, update.effective_user
+        if chat is not None and chat.id == owner and user is not None and user.id == owner:
             return True
-        log.warning("ignored a message from non-owner chat id %s", chat.id if chat is not None else None)
+        log.warning("ignored a message from non-owner chat id %s (user id %s)",
+                    chat.id if chat is not None else None, user.id if user is not None else None)
         return False
 
     async def owner_callback(update: Update) -> bool:
@@ -148,11 +158,16 @@ def build_application(svc: Any, clock: Callable[[], datetime] = now_ist) -> Appl
         await _answer(query)
         action, _, card_id = (query.data or "").partition(":")
         try:
-            outcome = await handle_card(card_id, action == "approve", svc, clock())
+            result = await handle_card_tap(card_id, action == "approve", svc, clock())
         except Exception as exc:  # noqa: BLE001 - the owner is told; only the type is logged
             log.error("handling a card tap failed: %s", describe_error(exc))
-            outcome = f"Could not process that tap ({type(exc).__name__}); see the log."
-        await _finish(query, outcome, owner)
+            # The card may well still be open, and a card without its buttons can never be approved.
+            result = CardResult(f"Could not process that tap ({type(exc).__name__}); see the log.",
+                                still_open=True)
+        if result.still_open:
+            await _send_new(query, result.text, owner)               # the card message keeps its buttons
+        else:
+            await _finish(query, result.text, owner)
 
     async def on_recovery(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await owner_callback(update):
@@ -198,16 +213,21 @@ async def _answer(query: Any) -> None:
 
 
 async def _finish(query: Any, outcome: str, owner: int) -> None:
-    """Append ``outcome`` to the card's message and drop the keyboard; if the message cannot be
-    edited (too old, or unchanged), send the outcome as a new message instead."""
+    """Append ``outcome`` to the card's message and drop the keyboard (the card is resolved); if the
+    message cannot be edited (too old, or unchanged), send the outcome as a new message instead."""
     original = getattr(query.message, "text", None) or ""
     try:
         await query.edit_message_text(text=_clip(f"{original}\n\n{outcome}" if original else outcome))
         return
     except TelegramError as exc:
         log.warning("could not edit the card message: %s", describe_error(exc))
+    await _send_new(query, outcome, owner)
+
+
+async def _send_new(query: Any, text: str, owner: int) -> None:
+    """Send ``text`` to the owner as a new message, leaving the tapped message (and its buttons) alone."""
     try:
-        for chunk in _chunks(outcome):
+        for chunk in _chunks(text):
             await query.get_bot().send_message(chat_id=owner, text=chunk)
     except TelegramError as exc:
-        log.error("could not send the outcome either: %s", describe_error(exc))
+        log.error("could not send the reply: %s", describe_error(exc))

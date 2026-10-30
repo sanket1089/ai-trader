@@ -26,6 +26,7 @@ import logging
 import math
 import uuid
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -276,6 +277,10 @@ def _stop(args: list[str], svc: Any, now: datetime) -> str:
     store.set_state(MANUAL_STOP_KEY, True)
     set_autopilot(store, False)
     store.set_state(TESTED_STOP_KEY, True)
+    if not callable(getattr(svc.executor, "cancel_order", None)):
+        # No store-only fallback: a kill switch must never pretend to cancel a live order. The
+        # switches above are already set, so nothing new can start; handle_command tells the owner.
+        raise ExecutorCannotCancel("the executor has no cancel_order; pending orders were not cancelled")
 
     cancelled: list[Order] = []
     failed: list[Order] = []
@@ -305,20 +310,14 @@ def _stop(args: list[str], svc: Any, now: datetime) -> str:
     return "\n".join(lines)
 
 
+class ExecutorCannotCancel(RuntimeError):
+    """The executor has no ``cancel_order``. /stop fails loudly rather than mark a live order
+    cancelled in the store while the broker still holds it."""
+
+
 def _cancel_pending(svc: Any, order: Order) -> bool:
-    """Cancel a pending order through the executor (broker and store). An executor without
-    ``cancel_order`` leaves only the store update."""
-    why = "cancelled: owner /stop"
-    cancel = getattr(svc.executor, "cancel_order", None)
-    if cancel is not None:
-        return bool(cancel(order.id, why))
-    stored = svc.store.get_order(order.id)
-    if stored is None or stored.status is not OrderStatus.PENDING:
-        return False
-    stored.status = OrderStatus.CANCELLED
-    stored.reason = f"{stored.reason}; {why}" if stored.reason else why
-    svc.store.update_order(stored)
-    return True
+    """Cancel a pending order through the executor (broker and store)."""
+    return bool(svc.executor.cancel_order(order.id, "cancelled: owner /stop"))
 
 
 def _resume(args: list[str], svc: Any, now: datetime) -> str:
@@ -416,27 +415,43 @@ async def _fresh_quote(svc: Any, symbol: str) -> Quote | None:
     return quote if quote is not None and _usable(quote.price) else None
 
 
+@dataclass(frozen=True)
+class CardResult:
+    """The reply to a card tap, and whether the card is still open (so its buttons must stay)."""
+
+    text: str
+    still_open: bool = False
+
+
 async def handle_card(card_id: str, approve: bool, svc: Any, now: datetime) -> str:
-    """Apply the owner's tap on a card and return the reply text.
+    """Apply the owner's tap on a card and return the reply text (see ``handle_card_tap``)."""
+    return (await handle_card_tap(card_id, approve, svc, now)).text
+
+
+async def handle_card_tap(card_id: str, approve: bool, svc: Any, now: datetime) -> CardResult:
+    """Apply the owner's tap on a card.
 
     The idea is always loaded from the store by the card's ``idea_id``; nothing else is trusted.
     APPROVED places one order per book with a size above 0 through ``svc.executor.submit``;
-    REISSUE closes the card and sends a fresh one at the current price.
+    REISSUE closes the card and sends a fresh one at the current price. ``still_open`` is True when
+    the tap left the card unresolved (no current price, or its idea is missing): the adapter then
+    keeps the card's buttons so the owner can tap again.
     """
     card = svc.approvals.get(card_id)
     if card is None:
-        return "That approval card is unknown."
+        return CardResult("That approval card is unknown.")
     idea = svc.store.get_idea(card.idea_id)
 
     quote: Quote | None = None
     if approve:
         if idea is None:
             log.error("card %s: its idea %s is missing; not approving", card_id, card.idea_id)
-            return "Cannot approve: the trade idea behind this card is missing. Nothing was ordered."
+            return CardResult("Cannot approve: the trade idea behind this card is missing. "
+                              "Nothing was ordered.", still_open=card.status == "open")
         quote = await _fresh_quote(svc, idea.symbol)
         if quote is None and card.status == "open" and now < card.expires_at:
-            return (f"No current price for {idea.symbol} right now, so the card was not resolved. "
-                    "It stays open: tap again in a moment.")
+            return CardResult(f"No current price for {idea.symbol} right now, so the card was not "
+                              "resolved. It stays open: tap again in a moment.", still_open=True)
     # A reject needs no price; an approve with no price on a card past its time still resolves (EXPIRED).
     price = quote.price if quote is not None else (math.nan if approve else card.quote_at_issue)
     resolution = svc.approvals.resolve(card_id, approve, price, now)
@@ -444,20 +459,20 @@ async def handle_card(card_id: str, approve: bool, svc: Any, now: datetime) -> s
     what = f"{idea.side} {idea.symbol}" if idea is not None else "the trade"
     if resolution is Resolution.APPROVED:
         svc.store.set_state(TESTED_APPROVAL_KEY, True)
-        return await _place_orders(svc, card, idea, quote, now)
+        return CardResult(await _place_orders(svc, card, idea, quote, now))
     if resolution is Resolution.REJECTED:
-        return f"Rejected {what}. Nothing was ordered."
+        return CardResult(f"Rejected {what}. Nothing was ordered.")
     if resolution is Resolution.EXPIRED:
         if now >= card.expires_at:
             # Only a card that ran out of time counts as "expiry tested": a card closed early by a
             # re-issue is also EXPIRED, and a late second tap on it must not tick the go-live box.
             svc.store.set_state(TESTED_EXPIRY_KEY, True)
-        return f"This card for {what} has expired and was not placed. Wait for the next one."
+        return CardResult(f"This card for {what} has expired and was not placed. Wait for the next one.")
     if resolution is Resolution.ALREADY_RESOLVED:
-        return "That card was already handled."
+        return CardResult("That card was already handled.")
     if resolution is Resolution.REISSUE:
-        return await _reissue(svc, card, idea, quote, now)
-    return "That approval card is unknown."
+        return CardResult(await _reissue(svc, card, idea, quote, now))
+    return CardResult("That approval card is unknown.")
 
 
 async def _place_orders(svc: Any, card: Any, idea: Any, quote: Quote | None, now: datetime) -> str:

@@ -1,4 +1,6 @@
 import logging
+import sqlite3
+from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,10 +61,15 @@ class FakeBot:
 class SpyExecutor:
     def __init__(self):
         self.calls: list[Order] = []
+        self.cancelled: list[str] = []
 
     async def submit(self, order, quote, now, idea=None):
         self.calls.append(order)
         return None
+
+    def cancel_order(self, order_id, why):
+        self.cancelled.append(order_id)
+        return True
 
 
 @pytest.fixture
@@ -104,15 +111,16 @@ def callback_update(bot, data, user_id=OWNER, chat_id=OWNER, text="BUY NIFTYBEES
                         "text": text}}}, bot)
 
 
-def message_update(bot, text, chat_id=OWNER):
+def message_update(bot, text, chat_id=OWNER, user_id=None):
+    """A message in ``chat_id`` sent by ``user_id`` (default: the chat's own user, as in a private chat)."""
     entities = []
     if text.startswith("/"):
         entities = [{"type": "bot_command", "offset": 0, "length": len(text.split()[0])}]
     return Update.de_json({
         "update_id": 2,
         "message": {"message_id": 1, "date": 1700000000, "chat": {"id": chat_id, "type": "private"},
-                    "from": {"id": chat_id, "is_bot": False, "first_name": "X"}, "text": text,
-                    "entities": entities}}, bot)
+                    "from": {"id": chat_id if user_id is None else user_id, "is_bot": False,
+                             "first_name": "X"}, "text": text, "entities": entities}}, bot)
 
 
 async def dispatch(app, update):
@@ -163,6 +171,13 @@ def test_every_command_is_registered_for_the_owner_chat_only(app):
     assert sum(isinstance(h, MessageHandler) for h in handlers) == 1       # the stranger catch-all
 
 
+@pytest.mark.parametrize("owner", [0, -1, -1001234567890])
+def test_a_non_positive_owner_id_is_refused_because_groups_are_not_supported(svc, owner):
+    svc.settings = svc.settings.model_copy(update={"telegram_owner_chat_id": owner})
+    with pytest.raises(ValueError, match="group chats are not supported"):
+        build_application(svc)
+
+
 def test_httpx_request_logs_are_kept_quiet_because_their_url_holds_the_token(app):
     assert logging.getLogger("httpx").level == logging.WARNING
     assert logging.getLogger("httpcore").level == logging.WARNING
@@ -206,6 +221,18 @@ async def test_non_owner_callback_with_unknown_data_is_answered_silently(app, bo
     assert bot.of("edit") == [] and bot.of("send") == []
 
 
+@pytest.mark.parametrize("text", ["/stop", "/autopilot on", "/pause", "/status"])
+async def test_a_command_in_the_owners_chat_from_another_user_gets_no_reply_and_does_nothing(
+        app, bot, svc, caplog, text):
+    with caplog.at_level(logging.INFO):
+        await dispatch(app, message_update(bot, text, chat_id=OWNER, user_id=STRANGER))
+
+    assert bot.calls == []
+    assert svc.store.get_state("manual_stop") is None and svc.store.get_state("paused") is None
+    assert get_autopilot(svc.store) is False
+    assert f"user id {STRANGER}" in caplog.text
+
+
 async def test_non_owner_command_gets_no_reply_and_changes_nothing(app, bot, svc, caplog):
     with caplog.at_level(logging.INFO):
         await dispatch(app, message_update(bot, "/stop", chat_id=STRANGER))
@@ -236,8 +263,13 @@ async def test_owner_command_arguments_reach_the_handler(app, bot, svc):
 
 
 async def test_owner_stop_command_sets_the_kill_switch(app, bot, svc):
+    svc.store.save_order(Order(id="e1", book=REAL, symbol=SYMBOL, side=Side.BUY, qty=1, limit_price=280.0,
+                               reason="trend", is_exit=False, idea_id="i1", created_at=NOW))
+
     await dispatch(app, message_update(bot, "/stop"))
+
     assert svc.store.get_state("manual_stop") is True
+    assert svc.executor.cancelled == ["e1"]
     assert "STOP" in bot.of("send")[0]["text"]
 
 
@@ -291,10 +323,54 @@ async def test_card_tap_that_blows_up_is_reported_without_the_error_text(app, bo
     with caplog.at_level(logging.INFO):
         await dispatch(app, callback_update(bot, "approve:abc"))
 
-    [edit] = bot.of("edit")
-    assert "Could not process that tap (RuntimeError)" in edit["text"]
-    assert TOKEN not in edit["text"] and TOKEN not in caplog.text
+    [sent] = bot.of("send")                                                # a new message: the card may still be
+    assert bot.of("edit") == []                                            # open, so its buttons are left alone
+    assert sent["chat_id"] == OWNER
+    assert "Could not process that tap (RuntimeError)" in sent["text"]
+    assert TOKEN not in sent["text"] and TOKEN not in caplog.text
     assert "RuntimeError" in caplog.text
+
+
+async def test_no_price_reply_keeps_the_card_buttons_and_a_second_tap_later_approves(app, bot, svc):
+    card = new_card(svc)
+    svc.market_data.by_symbol.clear()                                      # the feed has no price right now
+
+    await dispatch(app, callback_update(bot, f"approve:{card.id}"))
+
+    assert bot.of("edit") == []                  # the card message is untouched, so its ✅/❌ keyboard stays
+    [notice] = bot.of("send")
+    assert notice["chat_id"] == OWNER
+    assert "No current price" in notice["text"] and "tap again" in notice["text"]
+    assert svc.approvals.get(card.id).status == "open"
+    assert svc.executor.calls == []
+
+    svc.market_data.set(SYMBOL, 280.0, NOW - timedelta(minutes=1))         # the price is back: tap again
+    await dispatch(app, callback_update(bot, f"approve:{card.id}"))
+
+    assert svc.approvals.get(card.id).status == "approved"
+    assert [(o.book, o.qty) for o in svc.executor.calls] == [(REAL, 3), (LEARN, 71)]
+    [edit] = bot.of("edit")                                                # now it is resolved: keyboard goes
+    assert "Approved BUY NIFTYBEES." in edit["text"] and edit.get("reply_markup") is None
+
+
+async def test_missing_idea_reply_keeps_the_card_buttons(app, bot, svc, tmp_path):
+    card = new_card(svc)
+    with closing(sqlite3.connect(tmp_path / "t.db")) as conn, conn:
+        conn.execute("DELETE FROM ideas WHERE id = 'i1'")
+
+    await dispatch(app, callback_update(bot, f"approve:{card.id}"))
+
+    assert bot.of("edit") == []
+    assert "idea behind this card is missing" in bot.of("send")[0]["text"]
+    assert svc.approvals.get(card.id).status == "open"
+
+
+async def test_a_resolved_card_always_loses_its_keyboard(app, bot, svc):
+    card = new_card(svc)
+    await dispatch(app, callback_update(bot, f"reject:{card.id}"))
+    await dispatch(app, callback_update(bot, f"approve:{card.id}"))        # a late second tap: already handled
+    assert len(bot.of("edit")) == 2 and bot.of("send") == []
+    assert "already handled" in bot.of("edit")[1]["text"]
 
 
 async def test_if_the_card_message_cannot_be_edited_the_outcome_is_sent_as_a_new_message(app, bot, svc):
