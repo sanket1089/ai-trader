@@ -249,6 +249,62 @@ def test_pm_a_valid_idea_survives_next_to_invalid_ones(store, db_path):
     assert idea_count(db_path) == 1
 
 
+# ------------------------------------------------------------------------------ expected move cap
+def test_pm_caps_expected_move_at_the_limit_to_target_distance(store):
+    # Target is 0.3% above the limit; the model claims 20% to slip past the 3x cost rule.
+    (idea,) = run_pm(store, out(limit_price=280.0, stop=270.0, target=280.84, expected_move_pct=20.0))
+
+    assert idea.expected_move_pct == pytest.approx(0.3, abs=1e-9)
+    assert store.get_idea(idea.id).expected_move_pct == pytest.approx(0.3, abs=1e-9)  # the saved value too
+    assert store.get_idea(idea.id) == idea
+
+
+def test_pm_keeps_a_stated_move_below_the_limit_to_target_distance(store):
+    # 280 -> 300 is 7.14%; the model said 2%.
+    (idea,) = run_pm(store, out(limit_price=280.0, target=300.0, expected_move_pct=2.0))
+
+    assert idea.expected_move_pct == 2.0
+    assert store.get_idea(idea.id).expected_move_pct == 2.0
+
+
+def test_pm_keeps_a_stated_move_equal_to_the_distance(store):
+    (idea,) = run_pm(store, out(limit_price=200.0, stop=190.0, target=210.0, expected_move_pct=5.0),
+                     context=ctx(quotes={"NIFTYBEES": 200.0}))
+
+    assert idea.expected_move_pct == pytest.approx(5.0, abs=1e-9)
+
+
+def test_pm_logs_when_the_expected_move_is_reduced(store, caplog):
+    with caplog.at_level(logging.INFO, logger="aitrader.agents.portfolio"):
+        run_pm(store, out("NIFTYBEES", limit_price=280.0, stop=270.0, target=280.84, expected_move_pct=20.0),
+               out("GOLDBEES", "BUY", 60.0, 58.0, 63.0, 2.0))
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("NIFTYBEES" in m and "expected_move_pct" in m and "20" in m for m in messages)
+    assert not any("GOLDBEES" in m for m in messages)
+
+
+def test_pm_does_not_touch_the_expected_move_of_a_sell(store):
+    (idea,) = run_pm(store, out("TCS", "SELL", 3500.0, 3300.0, 3510.0, 20.0))
+
+    assert idea.expected_move_pct == 20.0
+
+
+def test_recovery_next_trades_get_the_same_expected_move_cap():
+    capped = out("NIFTYBEES", limit_price=280.0, stop=270.0, target=280.84, expected_move_pct=20.0)
+    lower = out("GOLDBEES", "BUY", 60.0, 58.0, 63.0, 2.0)
+    sell = out("TCS", "SELL", 3500.0, 3300.0, 3510.0, 20.0)
+    result = run_recovery_plan(FakeLLM(plan(capped, lower, sell)), ctx(), "stopped")
+
+    moves = {t.symbol: t.expected_move_pct for t in result.next_trades}
+    assert moves["NIFTYBEES"] == pytest.approx(0.3, abs=1e-9)
+    assert moves["GOLDBEES"] == 2.0 and moves["TCS"] == 20.0
+
+
+def test_pm_prompt_tells_the_model_the_move_is_capped_at_the_target_distance():
+    assert "never more than" in portfolio.PM_SYSTEM and "to target" in portfolio.PM_SYSTEM
+
+
 def test_pm_every_drop_is_logged_at_info_with_symbol_and_reason(store, caplog):
     with caplog.at_level(logging.INFO, logger="aitrader.agents.portfolio"):
         run_pm(store, out("NIFTYBEES", stop=290.0),
