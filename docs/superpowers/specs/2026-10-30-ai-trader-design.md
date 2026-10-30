@@ -87,7 +87,7 @@ The project has failed, even if the code works, if any of these happen:
 | Trading style | Swing trading: holding for days to weeks |
 | What it trades | ETFs and large-cap stocks priced within the budget |
 | Agent team | As in §7, accepted by the owner |
-| AI running cost | A lean budget is accepted. Estimated at a few hundred ₹/month. |
+| AI running cost | **Monthly cap of US$100** (owner decision). It is tracked in USD, because Anthropic bills in USD, and shown in ₹ as well. |
 | Project location | `C:\only\ai-trader`, its own git repository |
 | AI cost vs trading results | **Counted separately.** The AI bill is a learning cost. Trading results and the go-live criteria are judged net of trading charges only. AI spend is shown next to P&L in every daily summary and in `/budget`, so it is never hidden. |
 
@@ -207,7 +207,7 @@ Both books get the same research and the same ideas, sized separately for each.
 
 **Rate and spend limits**
 - A hard cap of 1 order per second, far below SEBI's 10 per second.
-- **AI budget cap** per month, configurable, with a ₹500 default (my call).
+- **AI budget cap** per month, configurable, set to **US$100** (owner decision).
   - At 80%, the system switches to fewer and cheaper calls.
   - At 100%, the AI agents stop and no new ideas are generated. Code still watches stop and target levels on existing positions.
 
@@ -284,7 +284,20 @@ All of these must hold before any real money is used. The owner makes the final 
 
 The first plan builds **Phase 1 only**: the full agent team, `PaperBroker`, Telegram, risk and scheduling, all behind the `Broker` interface. `LiveBroker`, the VPS and static-IP setup come in a separate plan once the go-live criteria are met and the broker is chosen.
 
-**AI budget sizing** (my call): to stay within the monthly cap, the AI-analysed universe starts at about 15–20 symbols, not the full Nifty 100. Intraday checks are code-only, and AI re-runs happen only when price moves or news trigger them.
+**AI budget sizing** (my call, within the owner's US$100 cap):
+
+**Screening:**
+- The universe is the **full Nifty 100 plus the ETFs** (NIFTYBEES, GOLDBEES, LIQUIDBEES, BANKBEES).
+- A cheap code screen of price and volume, plus a Haiku news triage, narrows it each morning to a shortlist of about 15–25 symbols for deep analysis by Sonnet.
+- Fundamental analysis covers the full universe weekly.
+
+**Intraday:**
+- Stop and target checks are code-only.
+- AI re-runs are triggered by large price moves or material news, about hourly at most.
+
+**Hitting the cap:**
+- The system aims to use about 60–70% of the cap in a normal month, leaving headroom.
+- The 80% and 100% behaviours in §8 still apply.
 
 ## 10.2 Open items for the Phase 2 plan
 
@@ -300,7 +313,7 @@ The first plan builds **Phase 1 only**: the full agent team, `PaperBroker`, Tele
 - Exact libraries: for example `python-telegram-bot`, APScheduler, `pandas` / `pandas-ta`, and the Anthropic Python SDK.
 - Project layout and module boundaries.
 - Prompt wording and JSON schemas for each agent.
-- The exact universe list (my starting suggestion: NIFTYBEES, GOLDBEES, LIQUIDBEES, plus Nifty 100 stocks whose price fits the budget).
+- The exact screening thresholds. The universe itself is set in §10.1. The ₹1,000 book can only take ideas whose price fits its cash.
 - The slippage model, the price band percentage and the stale-data threshold.
 - The source of the NSE holiday calendar.
 
