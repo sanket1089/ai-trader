@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import sqlite3
 from contextlib import closing
 from datetime import date, timedelta
@@ -463,10 +464,82 @@ async def test_retry_and_submit_share_one_lock(store, notifier, t):
     assert t.sleeps == [1.0, 1.0]
 
 
-async def test_notify_swallows_a_failing_notifier(store, notifier, t):
+async def test_notify_swallows_a_failing_notifier_and_reports_whether_it_got_through(store, notifier, t):
     notifier.fail = True
     ex = executor(store, FakeBroker(store), FakeRisk(), notifier, t)
-    await ex.notify("hello")                    # must not raise
+    assert await ex.notify("hello") is False           # must not raise
     notifier.fail = False
-    await ex.notify("hello")
+    assert await ex.notify("hello") is True
     assert notifier.texts == ["hello"]
+
+
+async def test_notify_once_marks_the_key_only_after_the_message_was_delivered(store, notifier, t):
+    ex = executor(store, FakeBroker(store), FakeRisk(), notifier, t)
+
+    notifier.fail = True
+    assert await ex.notify_once("k", "first") is False
+    assert store.get_state("k") is None                # not marked: nobody was told yet
+
+    notifier.fail = False
+    assert await ex.notify_once("k", "first") is True  # so it is tried again
+    assert store.get_state("k") is True
+    assert await ex.notify_once("k", "first") is False # and now it is once
+    assert notifier.texts == ["first"]
+
+
+async def test_notify_once_sends_again_when_the_key_was_re_armed(store, notifier, t):
+    ex = executor(store, FakeBroker(store), FakeRisk(), notifier, t)
+    await ex.notify_once("k", "x")
+    store.set_state("k", False)
+    assert await ex.notify_once("k", "x") is True
+    assert notifier.texts == ["x", "x"]
+
+
+# ---------------------------------------------------------------- one bad order must not stop the pass
+
+
+async def test_retry_carries_on_when_one_order_blows_up_and_alerts_once_per_day(store, notifier, t, caplog):
+    store.save_order(order(id="bad", symbol="GOLDBEES"))
+    store.save_order(order(id="good", symbol=SYMBOL))
+    broker = FakeBroker(store, fills=True)
+    ex = executor(store, broker, FakeRisk(raise_for={"GOLDBEES"}), notifier, t)
+    quotes = {SYMBOL: quote(), "GOLDBEES": quote(symbol="GOLDBEES")}
+
+    with caplog.at_level(logging.ERROR, logger="aitrader.execution"):
+        fills = await ex.retry_pending(quotes, NOW)
+
+    assert [f.order_id for f in fills] == ["good"]                        # the rest of the pass ran
+    assert store.get_order("good").status is OrderStatus.FILLED
+    assert store.get_order("bad").status is OrderStatus.PENDING           # left to the next retry
+    errors = [x for x in notifier.texts if "error" in x.lower()]
+    assert len(errors) == 1 and "GOLDBEES" in errors[0] and BOOK in errors[0] and "bad" in errors[0]
+    assert "RuntimeError" in errors[0]
+    assert "secret-token-123" not in " ".join(notifier.texts)             # never the exception message
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "RuntimeError" in logged and "GOLDBEES" in logged and BOOK in logged
+    assert "secret-token-123" not in logged and not any(r.exc_info for r in caplog.records)
+
+    # the same failure again, same day: still not alerted twice
+    await ex.retry_pending(quotes, NOW + timedelta(hours=1))
+    assert len([x for x in notifier.texts if "error" in x.lower()]) == 1
+    assert store.get_state(f"check_error_alerted:{BOOK}:GOLDBEES:{MON.isoformat()}") is True
+
+    # the next day it is told again
+    next_day = at(MON + timedelta(days=1), "10:00")
+    store.save_order(order(id="bad2", symbol="GOLDBEES", created_at=at(MON + timedelta(days=1), "09:30")))
+    await ex.retry_pending(quotes, next_day)
+    assert len([x for x in notifier.texts if "error" in x.lower()]) == 2
+
+
+async def test_retry_error_alert_is_retried_if_the_notifier_was_down(store, notifier, t):
+    store.save_order(order(id="bad", symbol="GOLDBEES"))
+    ex = executor(store, FakeBroker(store), FakeRisk(raise_for={"GOLDBEES"}), notifier, t)
+    quotes = {"GOLDBEES": quote(symbol="GOLDBEES")}
+
+    notifier.fail = True
+    await ex.retry_pending(quotes, NOW)
+    notifier.fail = False
+    await ex.retry_pending(quotes, NOW)
+    await ex.retry_pending(quotes, NOW)
+
+    assert len([x for x in notifier.texts if "error" in x.lower()]) == 1

@@ -49,15 +49,19 @@ class FakeNotifier:
 class FakeBroker:
     """Records every call. ``fills`` makes try_fill fill at the quote; ``rejects`` makes it reject."""
 
-    def __init__(self, store: Store | None = None, fills: bool = False, rejects: bool = False):
+    def __init__(self, store: Store | None = None, fills: bool = False, rejects: bool = False,
+                 raise_for: set[str] | None = None):
         self.store = store
         self.fills = fills
         self.rejects = rejects
+        self.raise_for = raise_for or set()      # symbols whose try_fill blows up
         self.calls: list[tuple[Order, Quote]] = []     # order snapshots as they were when called
         self.cancelled: list[str] = []
 
     def try_fill(self, order: Order, quote: Quote) -> Fill | None:
         self.calls.append((replace(order), quote))
+        if order.symbol in self.raise_for:
+            raise RuntimeError(f"broker exploded for {order.symbol}: secret-token-123")
         if self.rejects:
             order.status = OrderStatus.REJECTED
             if self.store is not None:
@@ -79,13 +83,17 @@ class FakeBroker:
 class FakeRisk:
     """Approves (or rejects with ``reasons``) every order and records what it was asked."""
 
-    def __init__(self, approve: bool = True, reasons: list[str] | None = None):
+    def __init__(self, approve: bool = True, reasons: list[str] | None = None,
+                 raise_for: set[str] | None = None):
         self.approve = approve
         self.reasons = reasons or []
+        self.raise_for = raise_for or set()      # symbols whose check blows up
         self.calls: list[tuple[Order, Quote | None, datetime, object]] = []
 
     def check(self, order: Order, quote: Quote | None, now: datetime, idea=None) -> RiskDecision:
         self.calls.append((replace(order), quote, now, idea))
+        if order.symbol in self.raise_for:
+            raise RuntimeError(f"risk exploded for {order.symbol}: secret-token-123")
         return RiskDecision(self.approve, list(self.reasons))
 
 

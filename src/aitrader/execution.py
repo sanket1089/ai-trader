@@ -23,7 +23,9 @@ Rules every method follows:
 
 import asyncio
 import logging
+import os
 import time
+import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import date, datetime
@@ -55,6 +57,15 @@ def _append_reason(reason: str, extra: str) -> str:
 
 def _describe(o: Order) -> str:
     return f"{o.book} {o.side} {o.qty} {o.symbol} @ limit {_rupees(o.limit_price)}"
+
+
+def describe_error(exc: BaseException) -> str:
+    """The error's type and where it was raised, never its message (it may hold a URL or a token)."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return type(exc).__name__
+    last = frames[-1]
+    return f"{type(exc).__name__} at {os.path.basename(last.filename)}:{last.lineno} in {last.name}"
 
 
 def _ist_day(now: datetime) -> date:
@@ -144,43 +155,76 @@ class Executor:
 
         A retried order the risk gate now refuses stays PENDING (its limit may become valid again,
         and a message on every retry would be noise); the decision is recorded.
+
+        An order whose retry raises is logged (error type and place, book, symbol; never the
+        message), the owner is told once per IST day per book and symbol, and the pass carries on.
         """
         if self._dry_run:
             return []
         today = _ist_day(now)
         fills: list[Fill] = []
         msgs: list[str] = []
+        failed: list[tuple[Order, str]] = []                        # (order, error type) to alert about
         try:
             async with self._lock:
                 for listed in self._store.pending_orders():
-                    order = self._store.get_order(listed.id)        # fresh: the lock may have waited
-                    if order is None or order.status is not OrderStatus.PENDING or order.is_exit:
+                    try:
+                        fill = await self._retry_one(listed.id, quotes, now, today, msgs)
+                    except Exception as exc:  # noqa: BLE001 - one bad order must not stop the pass
+                        log.error("retrying order %s (%s %s) failed: %s", listed.id, listed.book,
+                                  listed.symbol, describe_error(exc))
+                        failed.append((listed, type(exc).__name__))
                         continue
-                    created = order.created_at.astimezone(IST).date()
-                    if created < today:
-                        self._cancel(order, f"cancelled: left over from {created.isoformat()}")
-                        msgs.append(f"Cancelled {_describe(order)}: left over from {created.isoformat()}")
-                        continue
-                    quote = quotes.get(order.symbol)
-                    if quote is None:
-                        log.warning("no quote for %s; not retrying order %s", order.symbol, order.id)
-                        continue
-                    idea = self._store.get_idea(order.idea_id) if order.idea_id is not None else None
-                    fill = await self._attempt(order, quote, now, idea, msgs, is_new=False)
                     if fill is not None:
                         fills.append(fill)
         finally:
             await self._flush(msgs)
+            for order, error in failed:
+                await self.notify_once(
+                    f"check_error_alerted:{order.book}:{order.symbol}:{today.isoformat()}",
+                    f"{order.book} {order.symbol}: error ({error}) while retrying pending order "
+                    f"{order.id}; it stays pending and the other orders carried on")
         return fills
 
-    async def notify(self, text: str) -> None:
-        """Send ``text`` to the owner. Never raises: a down notifier must not break trading."""
+    async def notify(self, text: str) -> bool:
+        """Send ``text`` to the owner. Never raises (a down notifier must not break trading);
+        returns whether the notifier accepted it."""
         try:
             await self._notifier.send(text)
         except Exception as exc:  # noqa: BLE001 - only the type is logged: the message may hold a URL/token
             log.warning("notification failed: %s", type(exc).__name__)
+            return False
+        return True
+
+    async def notify_once(self, key: str, text: str) -> bool:
+        """Send ``text`` unless the state ``key`` is already set, and set it only once the message
+        went through, so an alert that could not be delivered is tried again. Returns True if sent."""
+        if self._store.get_state(key):
+            return False
+        if not await self.notify(text):
+            return False
+        self._store.set_state(key, True)
+        return True
 
     # ---- internals (call with the lock held) ----
+
+    async def _retry_one(self, order_id: str, quotes: Mapping[str, Quote], now: datetime, today: date,
+                         msgs: list[str]) -> Fill | None:
+        """Cancel or retry one listed PENDING order, working from the stored copy of it."""
+        order = self._store.get_order(order_id)                     # fresh: the lock may have waited
+        if order is None or order.status is not OrderStatus.PENDING or order.is_exit:
+            return None
+        created = order.created_at.astimezone(IST).date()
+        if created < today:
+            self._cancel(order, f"cancelled: left over from {created.isoformat()}")
+            msgs.append(f"Cancelled {_describe(order)}: left over from {created.isoformat()}")
+            return None
+        quote = quotes.get(order.symbol)
+        if quote is None:
+            log.warning("no quote for %s; not retrying order %s", order.symbol, order.id)
+            return None
+        idea = self._store.get_idea(order.idea_id) if order.idea_id is not None else None
+        return await self._attempt(order, quote, now, idea, msgs, is_new=False)
 
     async def _throttle(self) -> None:
         """Wait until ``min_interval_s`` has passed since the last order went out."""

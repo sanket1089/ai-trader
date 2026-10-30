@@ -1,7 +1,7 @@
 import logging
 import sqlite3
 from contextlib import closing
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -210,8 +210,27 @@ async def test_missing_stop_alert_is_per_position_and_survives_a_missing_quote(r
     # no quote at all for the symbol: the alert does not depend on it
     await rig.watcher.check(NOW)
     await rig.watcher.check(NOW)
-    assert sorted(rig.notifier.texts) == sorted([f"{BOOK} {SYMBOL} has no stop-loss set",
-                                                 f"{LEARNING} {SYMBOL} has no stop-loss set"])
+    no_stop = [x for x in rig.notifier.texts if "no stop-loss" in x]
+    assert sorted(no_stop) == sorted([f"{BOOK} {SYMBOL} has no stop-loss set",
+                                      f"{LEARNING} {SYMBOL} has no stop-loss set"])
+
+
+async def test_once_only_alert_is_marked_only_after_it_was_delivered(rig):
+    hold(rig.store, stop=0.0, target=300.0)
+    price(rig, 285.0, NOW)
+    key = f"nostop_alerted:{BOOK}:{SYMBOL}"
+
+    rig.notifier.fail = True                                 # Telegram is down for the first check
+    await rig.watcher.check(NOW)
+    assert rig.notifier.texts == [] and not rig.store.get_state(key)
+
+    rig.notifier.fail = False                                # next check: tried again, then marked
+    await rig.watcher.check(NOW + 3 * MIN)
+    assert rig.notifier.texts == [f"{BOOK} {SYMBOL} has no stop-loss set"]
+    assert rig.store.get_state(key) is True
+
+    await rig.watcher.check(NOW + 6 * MIN)
+    assert len(rig.notifier.texts) == 1
 
 
 async def test_missing_stop_alert_rearms_once_a_stop_is_set(rig):
@@ -244,43 +263,106 @@ async def test_no_duplicate_exit_when_pending(slow_rig):
     assert rig.store.get_order(first).attempts == 0
 
 
+async def step(rig, minutes, p):
+    """One check ``minutes`` after NOW, with the price at ``p``."""
+    later = NOW + minutes * MIN
+    price(rig, p, later)
+    return await rig.watcher.check(later)
+
+
 async def test_reprice_after_2min_max_3_then_alert_once(slow_rig):
     rig = slow_rig
     hold(rig.store)
-    price(rig, 268.0, NOW)
-    await rig.watcher.check(NOW)
+    await step(rig, 0, 268.0)
     [oid] = order_ids(rig.db_path)
 
-    # 1 minute old: too soon
-    price(rig, 267.0, NOW + 1 * MIN)
-    await rig.watcher.check(NOW + 1 * MIN)
-    assert rig.store.get_order(oid).attempts == 0 and len(rig.broker.calls) == 1
+    def stored():
+        return rig.store.get_order(oid)
 
-    # then every 2 minutes: reprice at the current price, three times
-    expected = []
-    for n, minutes in enumerate((2, 4, 6), start=1):
-        later = NOW + minutes * MIN
-        p = 266.0 - n
-        price(rig, p, later)
-        await rig.watcher.check(later)
-        stored = rig.store.get_order(oid)
-        expected.append((exit_limit(p, 1.0), n))
-        assert (stored.limit_price, stored.attempts, stored.status) == (expected[-1] + (OrderStatus.PENDING,))
-        assert order_ids(rig.db_path) == [oid]               # always the same order
-    assert [(o.limit_price, o.attempts) for o, _ in rig.broker.calls][1:] == expected
-    assert rig.notifier.texts == []                          # no alert yet
+    await step(rig, 1, 267.0)                                # 1 minute old: too soon
+    assert stored().attempts == 0 and len(rig.broker.calls) == 1
 
-    # the fourth time it is left pending and the owner is told, once
-    for minutes in (8, 10, 12):
-        later = NOW + minutes * MIN
-        price(rig, 260.0, later)
-        await rig.watcher.check(later)
-    stored = rig.store.get_order(oid)
-    assert stored.attempts == 3 and stored.status is OrderStatus.PENDING
-    assert len(rig.broker.calls) == 4                        # initial try + 3 reprices
+    await step(rig, 2, 265.0)                                # 2 minutes: re-priced at the current price
+    assert (stored().limit_price, stored().attempts) == (exit_limit(265.0, 1.0), 1)
+    assert datetime.fromisoformat(rig.store.get_state(f"exit_repriced_at:{oid}")) == NOW + 2 * MIN
+
+    await step(rig, 3, 264.0)                                # only 1 minute since the last re-price
+    assert stored().attempts == 1 and len(rig.broker.calls) == 2
+
+    await step(rig, 4, 263.0)
+    await step(rig, 6, 262.0)
+    assert stored().attempts == 3 and rig.notifier.texts == []       # three re-prices, no alert yet
+
+    await step(rig, 8, 261.0)                                # the 4th: past the cap, the owner is told
+    assert stored().attempts == 4
     [alert] = rig.notifier.texts
     assert BOOK in alert and SYMBOL in alert and oid in alert
     assert rig.store.get_state(f"exit_alerted:{oid}") is True
+
+    await step(rig, 10, 260.0)                               # and it keeps being re-priced, silently
+    await step(rig, 12, 259.0)
+    assert stored().attempts == 6 and stored().status is OrderStatus.PENDING
+    assert len(rig.notifier.texts) == 1                      # the alert fired exactly once
+    assert order_ids(rig.db_path) == [oid]                   # always the same single exit order
+    assert [(o.limit_price, o.attempts) for o, _ in rig.broker.calls][1:] == [
+        (exit_limit(p, 1.0), n) for n, p in enumerate((265.0, 263.0, 262.0, 261.0, 260.0, 259.0), start=1)]
+
+
+async def test_exit_keeps_being_tried_after_the_cap_and_fills_when_the_price_recovers(slow_rig):
+    rig = slow_rig
+    hold(rig.store)
+    await step(rig, 0, 268.0)
+    [oid] = order_ids(rig.db_path)
+    for minutes in (2, 4, 6, 8, 10):                         # 5 re-prices: past the cap of 3
+        await step(rig, minutes, 266.0)
+    assert rig.store.get_order(oid).attempts == 5 and len(rig.broker.calls) == 6
+
+    rig.broker.fills = True                                  # the price recovers through the limit
+    fills = await step(rig, 12, 270.0)
+
+    assert [f.order_id for f in fills] == [oid]
+    assert rig.store.get_order(oid).status is OrderStatus.FILLED
+    assert len(rig.broker.calls) == 7                        # try_fill was called every time
+
+
+async def test_a_day_old_pending_exit_is_repriced_the_next_day(slow_rig):
+    """Friday's exit never filled and used up its re-prices; Monday's first check re-prices it again
+    instead of leaving it at a stale limit (and blocking every new exit for the holding)."""
+    rig = slow_rig
+    hold(rig.store)
+    friday = at(date(2026, 10, 30), "10:00")
+    for minutes in (0, 2, 4, 6, 8):                          # created, then 4 re-prices: past the cap
+        price(rig, 268.0, friday + minutes * MIN)
+        await rig.watcher.check(friday + minutes * MIN)
+    [oid] = order_ids(rig.db_path)
+    assert rig.store.get_order(oid).attempts == 4
+
+    price(rig, 262.0, NOW)                                   # Monday 10:00
+    assert await rig.watcher.check(NOW) == []
+
+    fresh = rig.store.get_order(oid)
+    assert (fresh.limit_price, fresh.attempts, fresh.status) == (exit_limit(262.0, 1.0), 5, OrderStatus.PENDING)
+    assert order_ids(rig.db_path) == [oid]
+    assert len(rig.broker.calls) == 6
+
+
+async def test_unfilled_exit_alert_is_retried_until_it_was_delivered(slow_rig):
+    rig = slow_rig
+    hold(rig.store)
+    await step(rig, 0, 268.0)
+    [oid] = order_ids(rig.db_path)
+    for minutes in (2, 4, 6):
+        await step(rig, minutes, 266.0)
+
+    rig.notifier.fail = True
+    await step(rig, 8, 266.0)                                # past the cap, but Telegram is down
+    assert rig.notifier.texts == [] and not rig.store.get_state(f"exit_alerted:{oid}")
+
+    rig.notifier.fail = False
+    await step(rig, 10, 266.0)                               # delivered now, and marked
+    assert len(rig.notifier.texts) == 1 and rig.store.get_state(f"exit_alerted:{oid}") is True
+    await step(rig, 12, 266.0)
+    assert len(rig.notifier.texts) == 1
 
 
 async def test_reprice_that_fills_returns_the_fill_and_stops_repricing(slow_rig):
@@ -367,7 +449,7 @@ async def test_stale_quote_is_skipped_so_the_risk_gate_is_not_spammed(rig, caplo
     with caplog.at_level(logging.WARNING, logger="aitrader.exits"):
         assert await rig.watcher.check(NOW) == []
 
-    assert order_ids(rig.db_path) == [] and rig.notifier.texts == []
+    assert order_ids(rig.db_path) == [] and rig.broker.calls == [] and rig.risk.calls == []
     assert any("stale" in r.getMessage() for r in caplog.records)
 
 
@@ -376,6 +458,119 @@ async def test_unusable_price_is_skipped(rig):
     price(rig, float("nan"), NOW)
     assert await rig.watcher.check(NOW) == []
     assert order_ids(rig.db_path) == []
+
+
+BLIND = f"no fresh price for {SYMBOL}; its stop-loss can't be checked"
+
+
+def blind_alerts(rig):
+    return [x for x in rig.notifier.texts if "no fresh price" in x]
+
+
+@pytest.mark.parametrize("kind", ["missing", "stale", "nan"])
+async def test_blind_stop_alerts_the_owner_once_per_day(rig, kind):
+    hold(rig.store)
+
+    def feed(now):
+        if kind == "stale":
+            rig.md.set(SYMBOL, 280.0, now - timedelta(minutes=40))
+        elif kind == "nan":
+            rig.md.set(SYMBOL, float("nan"), now - MIN)
+
+    feed(NOW)
+    await rig.watcher.check(NOW)
+    assert blind_alerts(rig) == [BLIND]
+
+    feed(NOW + 3 * MIN)
+    await rig.watcher.check(NOW + 3 * MIN)                   # same day: not again
+    assert blind_alerts(rig) == [BLIND]
+
+    tomorrow = at(MON + timedelta(days=1), "10:00")
+    feed(tomorrow)
+    await rig.watcher.check(tomorrow)                        # a new day: told again
+    assert blind_alerts(rig) == [BLIND, BLIND]
+    assert rig.store.get_state(f"noquote_alerted:{BOOK}:{SYMBOL}:{MON.isoformat()}") is True
+
+
+async def test_no_blind_stop_alert_while_the_price_is_fresh(rig):
+    hold(rig.store)
+    price(rig, 285.0, NOW)
+    await rig.watcher.check(NOW)
+    assert rig.notifier.texts == []
+
+
+async def test_blind_stop_alert_is_retried_if_the_notifier_was_down(rig):
+    hold(rig.store)
+    rig.notifier.fail = True
+    await rig.watcher.check(NOW)
+    rig.notifier.fail = False
+    await rig.watcher.check(NOW + 3 * MIN)
+    await rig.watcher.check(NOW + 6 * MIN)
+    assert blind_alerts(rig) == [BLIND]
+
+
+# ---------------------------------------------------------------- one bad position must not stop the pass
+
+
+def errors(rig):
+    return [x for x in rig.notifier.texts if "error" in x.lower()]
+
+
+async def test_one_failing_position_does_not_stop_the_pass_and_the_owner_is_told_once(rig, caplog):
+    rig.risk.raise_for = {"GOLDBEES"}                        # sorts first, so it fails before NIFTYBEES
+    hold(rig.store, symbol="GOLDBEES")
+    hold(rig.store, symbol=SYMBOL)
+    price(rig, 250.0, NOW, symbol="GOLDBEES")
+    price(rig, 268.0, NOW)
+
+    with caplog.at_level(logging.ERROR, logger="aitrader.exits"):
+        fills = await rig.watcher.check(NOW)
+
+    assert [f.symbol for f in fills] == [SYMBOL]             # the other position's stop still sold
+    [alert] = errors(rig)
+    assert BOOK in alert and "GOLDBEES" in alert and "RuntimeError" in alert
+    assert "secret-token-123" not in " ".join(rig.notifier.texts)        # never the exception message
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "RuntimeError" in logged and "GOLDBEES" in logged and BOOK in logged
+    assert "secret-token-123" not in logged and not any(r.exc_info for r in caplog.records)
+
+    rig.store.remove_position(BOOK, SYMBOL)                  # NIFTYBEES is sold; GOLDBEES keeps failing
+    await rig.watcher.check(NOW + 3 * MIN)
+    assert len(errors(rig)) == 1                             # same day: still once
+    assert rig.store.get_state(f"check_error_alerted:{BOOK}:GOLDBEES:{MON.isoformat()}") is True
+
+    tomorrow = at(MON + timedelta(days=1), "10:00")
+    price(rig, 250.0, tomorrow, symbol="GOLDBEES")
+    await rig.watcher.check(tomorrow)
+    assert len(errors(rig)) == 2                             # a new day: told again
+
+
+async def test_a_broker_error_is_contained_and_the_exit_is_picked_up_again(rig):
+    rig.broker.raise_for = {SYMBOL}
+    hold(rig.store)
+    price(rig, 268.0, NOW)
+
+    assert await rig.watcher.check(NOW) == []                # the broker blew up: nothing escapes
+    assert len(errors(rig)) == 1
+    [oid] = order_ids(rig.db_path)
+    assert rig.store.get_order(oid).status is OrderStatus.PENDING     # saved before the broker call
+
+    rig.broker.raise_for = set()                             # the broker is back
+    fills = await step(rig, 2, 267.0)
+    assert [f.order_id for f in fills] == [oid]              # the same exit is re-priced and fills
+    assert order_ids(rig.db_path) == [oid]
+
+
+async def test_error_alert_is_retried_if_the_notifier_was_down(rig):
+    rig.risk.raise_for = {SYMBOL}
+    hold(rig.store)
+    price(rig, 268.0, NOW)
+    rig.notifier.fail = True
+    await rig.watcher.check(NOW)
+    rig.notifier.fail = False
+    await rig.watcher.check(NOW + MIN)
+    await rig.watcher.check(NOW + 2 * MIN)
+    assert len(errors(rig)) == 1
 
 
 # ---------------------------------------------------------------- with the real risk gate
