@@ -5,7 +5,7 @@ Reasons are short, human-readable sentences (they are shown on Telegram).
 
 Three kinds of order, with different rules:
 
-* entry: a BUY. All rules apply.
+* entry: a BUY. All rules apply, including the owner's pause and manual stop.
 * discretionary sell: a SELL that is not an exit. Same window and band as an entry, plus the
   weekly sell-day cap. Not blocked by the loss limits.
 * exit: ``is_exit`` SELL (stop, target, forced). Wider window (``exit_start`` to the 15:30 close),
@@ -37,6 +37,10 @@ from aitrader.risk.limits import TOLERANCE, LimitState, LossLimits
 from aitrader.store import Store
 
 MARKET_CLOSE = "15:30"   # exits may be placed until the close; entries stop at ``risk.entry_end``
+
+# Owner switches (set by /pause, /stop and cleared by /resume): entries are blocked while either is set.
+PAUSED_KEY = "paused"
+MANUAL_STOP_KEY = "manual_stop"
 
 _STATE_REASONS = {
     LimitState.DAILY_PAUSED: "daily loss limit reached: no new entries today",
@@ -144,6 +148,7 @@ class RiskManager:
             reasons += self._check_band(kind, order.limit_price, price)
 
         if kind == "entry":
+            reasons += self._check_owner_switches()
             if known:
                 reasons += self._check_entry_book_rules(order, book_cfg, book_limits, now, today, pending)
             if known and qty_ok and limit_ok:
@@ -191,6 +196,19 @@ class RiskManager:
         if abs(limit - price) > width + TOLERANCE:
             return [f"limit {limit:.2f} is outside ±{risk.entry_band_pct:g}% of last price {price:.2f}"]
         return []
+
+    def _check_owner_switches(self) -> list[str]:
+        """The owner's /pause and /stop (state ``paused`` and ``manual_stop``) block every new entry.
+
+        Any truthy stored value counts as set: an odd value fails toward blocking. Sells and exits
+        never come through here.
+        """
+        reasons = []
+        if self._store.get_state(PAUSED_KEY):
+            reasons.append("trading paused by owner")
+        if self._store.get_state(MANUAL_STOP_KEY):
+            reasons.append("manual stop active")
+        return reasons
 
     def _check_entry_book_rules(self, order: Order, book_cfg: BookConfig, book_limits: LossLimits,
                                 now: datetime, today: date, pending: list[Order]) -> list[str]:

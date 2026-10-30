@@ -543,3 +543,32 @@ async def test_retry_error_alert_is_retried_if_the_notifier_was_down(store, noti
     await ex.retry_pending(quotes, NOW)
 
     assert len([x for x in notifier.texts if "error" in x.lower()]) == 1
+
+
+# ---------------------------------------------------------------- cancel_order (the /stop kill switch)
+
+
+def test_cancel_order_cancels_a_pending_order_at_the_broker_and_in_the_store(store, notifier, t):
+    broker = FakeBroker(store)
+    ex = executor(store, broker, FakeRisk(), notifier, t)
+    store.save_order(order(id="p1"))
+
+    assert ex.cancel_order("p1", "cancelled: /stop") is True
+
+    assert broker.cancelled == ["p1"]
+    stored = store.get_order("p1")
+    assert stored.status is OrderStatus.CANCELLED
+    assert stored.reason == "trend; cancelled: /stop"
+
+
+def test_cancel_order_ignores_missing_and_closed_orders(store, notifier, t):
+    broker = FakeBroker(store)
+    ex = executor(store, broker, FakeRisk(), notifier, t)
+    done = order(id="done")
+    done.status = OrderStatus.FILLED
+    store.save_order(done)
+
+    assert ex.cancel_order("nope", "why") is False
+    assert ex.cancel_order("done", "why") is False
+    assert broker.cancelled == []
+    assert store.get_order("done").status is OrderStatus.FILLED

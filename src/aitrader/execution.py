@@ -186,6 +186,21 @@ class Executor:
                     f"{order.id}; it stays pending and the other orders carried on")
         return fills
 
+    def cancel_order(self, order_id: str, why: str) -> bool:
+        """Cancel one PENDING order (the owner's /stop): tell the broker, then record CANCELLED with
+        ``why`` appended to the reason. Returns False if the order is missing or no longer pending.
+
+        Synchronous on purpose: with no ``await`` between the read and the write, nothing else on the
+        event loop can fill the order in between, so the kill switch cannot race a fill. It takes no
+        lock for the same reason (the lock only serialises the throttle waits). The owner is not
+        messaged here; the caller reports.
+        """
+        order = self._store.get_order(order_id)             # never a caller's copy
+        if order is None or order.status is not OrderStatus.PENDING:
+            return False
+        self._cancel(order, why)
+        return True
+
     async def notify(self, text: str) -> bool:
         """Send ``text`` to the owner. Never raises (a down notifier must not break trading);
         returns whether the notifier accepted it."""

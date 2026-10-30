@@ -152,6 +152,26 @@ def test_loss_numbers_are_reported_signed(limits):
     assert ev.state is LimitState.ACTIVE
 
 
+def test_losses_match_evaluate_but_write_nothing(limits, store):
+    keys = ("hard_stop:realistic", "paused_on:realistic")
+    before = [store.get_state(k) for k in keys]
+    daily, total = limits.losses(450.0, NOON_MON)                 # far past both limits
+    assert daily == pytest.approx(550.0)
+    assert total == pytest.approx(550.0)
+    assert [store.get_state(k) for k in keys] == before           # no pause or stop was recorded
+    assert limits.state(NOON_MON) is LimitState.ACTIVE
+    ev = limits.evaluate(450.0, NOON_MON)
+    assert (ev.daily_loss, ev.total_loss) == (daily, total)
+
+
+def test_losses_are_signed_and_need_an_aware_now(limits):
+    daily, total = limits.losses(1030.0, NOON_MON)
+    assert daily == pytest.approx(-30.0)
+    assert total == pytest.approx(-30.0)
+    with pytest.raises(ValueError):
+        limits.losses(1000.0, datetime(2026, 11, 2, 12, 0))
+
+
 # ---------------------------------------------------------------- limits: daily
 
 

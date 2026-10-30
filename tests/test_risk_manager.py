@@ -835,3 +835,51 @@ def test_order_under_check_does_not_make_today_a_sell_day_for_itself(rm, store):
 
 def test_idea_for_a_different_symbol_is_rejected(rm):
     only_reason(check(rm, buy(), i=idea(symbol="GOLDBEES")), "idea is for a different symbol")
+
+
+# ---------------------------------------------------------------- owner switches: paused and manual_stop
+
+
+@pytest.mark.parametrize("flag, reason", [("paused", "trading paused by owner"),
+                                          ("manual_stop", "manual stop active")])
+def test_owner_switch_blocks_entry(rm, store, flag, reason):
+    store.set_state(flag, True)
+    only_reason(check(rm, buy()), reason)
+
+
+@pytest.mark.parametrize("book", [BOOK, LEARNING])
+def test_owner_switch_blocks_entry_in_every_book(rm, store, book):
+    store.set_state("paused", True)
+    only_reason(check(rm, buy(book=book)), "trading paused by owner")
+
+
+def test_both_owner_switches_give_both_reasons(rm, store):
+    store.set_state("paused", True)
+    store.set_state("manual_stop", True)
+    d = check(rm, buy())
+    assert not d.approved
+    assert "trading paused by owner" in d.reasons
+    assert "manual stop active" in d.reasons
+
+
+@pytest.mark.parametrize("flag", ["paused", "manual_stop"])
+@pytest.mark.parametrize("value", [None, False])
+def test_cleared_owner_switch_does_not_block(rm, store, flag, value):
+    store.set_state(flag, value)
+    assert check(rm, buy()).approved
+
+
+@pytest.mark.parametrize("flag", ["paused", "manual_stop"])
+@pytest.mark.parametrize("kind", ["sell", "exit"])
+def test_owner_switch_does_not_block_sells_and_exits(rm, store, flag, kind):
+    hold(store)
+    store.set_state(flag, True)
+    d = check(rm, make(kind))
+    assert d.approved, d.reasons
+
+
+@pytest.mark.parametrize("flag", ["paused", "manual_stop"])
+def test_owner_switch_cannot_be_dodged_by_flagging_a_buy_as_an_exit(rm, store, flag):
+    store.set_state(flag, True)
+    d = check(rm, buy(is_exit=True))
+    assert any(r in d.reasons for r in ("trading paused by owner", "manual stop active")), d.reasons

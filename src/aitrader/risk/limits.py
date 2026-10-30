@@ -162,6 +162,18 @@ class LossLimits:
         return LimitEval(state=state, newly_triggered=state is not LimitState.ACTIVE and state != before,
                          daily_loss=daily_loss, total_loss=total_loss)
 
+    def losses(self, equity: float, now: datetime) -> tuple[float, float]:
+        """``(daily_loss, total_loss)`` at ``equity``, measured as ``evaluate`` measures them.
+
+        Read-only: unlike ``evaluate`` it never latches a pause or a stop, so status displays can
+        use it without hiding a transition from the job that alerts the owner.
+        """
+        if not math.isfinite(equity):
+            raise ValueError(f"equity must be a finite number, got {equity!r}")
+        today = _ist_day(now)
+        base = self.baseline()
+        return self._daily_reference(today, base) - equity, base - equity
+
     def reset_baseline(self, equity: float) -> None:
         """Approved recovery: measure total loss from ``equity`` from now on.
 
