@@ -16,6 +16,7 @@ dependencies = [
     "pandas",
     "feedparser",
     "httpx",
+    "tzdata",
     "python-telegram-bot[job-queue]>=21",
 ]
 
