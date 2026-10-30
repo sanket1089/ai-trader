@@ -111,9 +111,10 @@ The agents use AI for judgment. The rules and the order placement are plain, pre
 
 **Agent output.** Every agent returns structured JSON that follows a schema. Its outputs and reasoning are stored, so any trade can be explained afterwards.
 
-**AI models** (builder's call, mine to confirm)
-- Claude Sonnet 5.5 (`claude-sonnet-5-5`) for the Portfolio Manager, the analysts and the Reviewer.
-- Claude Haiku 4.5 (`claude-haiku-4-5-20251001`) for bulk news triage and summaries.
+**AI models** (my call, revised during planning)
+- Every agent defaults to **Claude Opus 5.5** (`claude-opus-5-5`), at a per-agent effort level: low for news and analysts, medium for the Portfolio Manager and the Reviewer.
+- The model is configurable per agent in `config.yaml`. Switching any agent to Sonnet 5.5 (`claude-sonnet-5-5`) or Haiku 4.5 (`claude-haiku-4-5`) to save money is the **owner's decision**, so nothing is downgraded automatically.
+- Under budget pressure (80%), the system lowers effort and makes fewer calls. It does not change models.
 
 ### 7.2 Daily rhythm (IST, NSE trading days only, using the NSE holiday calendar)
 
@@ -298,6 +299,7 @@ The first plan builds **Phase 1 only**: the full agent team, `PaperBroker`, Tele
 **Hitting the cap:**
 - The system aims to use about 60–70% of the cap in a normal month, leaving headroom.
 - The 80% and 100% behaviours in §8 still apply.
+- News triage across the whole universe is code-filtered first (keyword and symbol match), so only relevant headlines reach the model.
 
 ## 10.2 Open items for the Phase 2 plan
 
