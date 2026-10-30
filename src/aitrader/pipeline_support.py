@@ -7,7 +7,10 @@ A notifier failure is logged (error type only) and never fails a job.
 State keys written here:
 
 * ``acted_ideas`` (list of idea ids): ideas already carded or submitted today (reset by premarket),
-  so no idea is ever acted on twice.
+  so no idea, and no second idea for the same (symbol, side), is acted on twice in a day. An idea
+  is marked only when its card or order goes out; one skipped for a missing or stale quote waits
+  for the next pass (``exits_job`` retries inside the entry window).
+* ``recovery_error:<book>:<stop_id>`` and the guard's ``job_error:<job>:<type>:<date>``: once-only alerts.
 * ``recovery_plan:<book>:<stop_id>`` (text) and ``recovery_sent:<book>:<stop_id>`` (bool): the
   recovery plan is written once per stop and marked sent once the notifier took it.
 """
@@ -26,6 +29,7 @@ from aitrader.agents.portfolio import PMContext, run_recovery_plan
 from aitrader.agents.schemas import FundamentalView, NewsDigest, RecoveryPlan, TechnicalBatch
 from aitrader.approvals import get_autopilot, set_autopilot
 from aitrader.calendar import IST
+from aitrader.data.market_data import is_stale
 from aitrader.execution import describe_error
 from aitrader.models import Order, Quote, Side, TradeIdea
 from aitrader.risk.equity import book_equity
@@ -85,6 +89,20 @@ async def notify(svc: Any, text: str) -> bool:
     except Exception as exc:  # noqa: BLE001 - a down notifier must never fail a job
         log.error("notifier failed: %s", describe_error(exc))
         return False
+
+
+async def notify_once(svc: Any, key: str, text: str) -> bool:
+    """Send once per state ``key`` (through ``executor.notify_once`` when it has one); the key is set
+    only after the message went through."""
+    sender = getattr(svc.executor, "notify_once", None)
+    if callable(sender):
+        return bool(await sender(key, text))
+    if svc.store.get_state(key):
+        return False
+    if await notify(svc, text):
+        svc.store.set_state(key, True)
+        return True
+    return False
 
 
 async def fetch_quotes(svc: Any, symbols: Iterable[str]) -> dict[str, Quote]:
@@ -182,7 +200,14 @@ async def check_limits(svc: Any, now: datetime, quotes: dict[str, Quote] | None 
                               f"close, limit {inr(cfg.daily_loss_limit)}). No new entries in this book until "
                               "the next trading day; exits keep working.")
         if ev.state is LimitState.HARD_STOPPED:
-            await send_recovery_once(svc, cfg.name, ev, now, quotes)
+            try:
+                await send_recovery_once(svc, cfg.name, ev, now, quotes)
+            except Exception as exc:  # noqa: BLE001 - must never abort the entries pass that called us
+                where = describe_error(exc)
+                log.error("recovery plan for %s failed: %s", cfg.name, where)
+                await notify_once(svc, f"recovery_error:{cfg.name}:{limits.stop_id()}",
+                                  f"{cfg.name}: the recovery plan could not be written ({where}); "
+                                  "it will be tried again. See the log.")
     return out
 
 
@@ -312,14 +337,18 @@ async def _act_on_ideas(svc: Any, ideas: list[TradeIdea], now: datetime) -> None
     evals = await check_limits(svc, now, held_quotes)
     autopilot = get_autopilot(store)                      # read after check_limits: a stop turns it off
     acted = list(store.get_state(ACTED_KEY) or [])
+    acted_pairs = acted_symbol_sides(store, acted)
     for idea in ideas:
         if idea.id in acted:
             continue
-        acted.append(idea.id)
-        store.set_state(ACTED_KEY, acted)                 # marked first: never acted on twice
+        if (idea.symbol, str(idea.side)) in acted_pairs:
+            log.info("%s %s was already acted on today; idea %s skipped", idea.side, idea.symbol, idea.id)
+            continue
+        # Not marked acted until a card or an order goes out: a missing or stale quote (the delayed
+        # feed before about 09:40) leaves it for the next pass of exits_job.
         quote = (await fetch_quotes(svc, [idea.symbol])).get(idea.symbol)
-        if quote is None:
-            await notify(svc, f"Skipped {idea.side} {idea.symbol}: no current price.")
+        if quote is None or is_stale(quote, now, svc.settings.risk):
+            log.info("%s %s: no fresh quote yet; will try again", idea.side, idea.symbol)
             continue
         idea = reanchor(svc, idea, quote)
         if idea is None:
@@ -329,10 +358,28 @@ async def _act_on_ideas(svc: Any, ideas: list[TradeIdea], now: datetime) -> None
             log.info("idea %s %s: no book can take it (unaffordable, limits or nothing held)",
                      idea.side, idea.symbol)
             continue
+        acted.append(idea.id)
+        store.set_state(ACTED_KEY, acted)                 # marked before the await: never acted on twice
+        acted_pairs.add((idea.symbol, str(idea.side)))
         if autopilot:
             await _submit(svc, idea, sizes, quote, now)
         else:
             await _send_card(svc, idea, sizes, quote, now)
+
+
+def acted_symbol_sides(store: Any, acted: list[str]) -> set[tuple[str, str]]:
+    """(symbol, side) of every idea acted on today (``acted_ideas`` is reset by premarket)."""
+    pairs: set[tuple[str, str]] = set()
+    for idea_id in acted:
+        idea = store.get_idea(idea_id)
+        if idea is not None:
+            pairs.add((idea.symbol, str(idea.side)))
+    return pairs
+
+
+def unacted_ideas(svc: Any, ideas: list[TradeIdea]) -> list[TradeIdea]:
+    acted = set(svc.store.get_state(ACTED_KEY) or [])
+    return [i for i in ideas if i.id not in acted]
 
 
 async def _submit(svc: Any, idea: TradeIdea, sizes: dict[str, int], quote: Quote, now: datetime) -> None:

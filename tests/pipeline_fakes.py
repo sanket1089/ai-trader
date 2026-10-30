@@ -60,7 +60,10 @@ class FakeLLM:
 
     def run(self, agent, system, user, output_model, max_tokens=16000):
         self.calls.append((agent, output_model.__name__))
-        return self.responses.get(output_model.__name__)
+        result = self.responses.get(output_model.__name__)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class RecordingNotifier:

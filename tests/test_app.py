@@ -111,6 +111,22 @@ async def test_guard_catches_and_notifies(tmp_path, caplog):
     assert "secret" not in svc.notifier.texts[0] and "secret" not in caplog.text
 
 
+async def test_guard_alerts_once_per_job_error_type_per_day(tmp_path, caplog):
+    async def boom(svc, now):
+        raise RuntimeError("x")
+
+    now = at(MON, "10:20")
+    svc = make_svc(tmp_path, md(now), now=now, spy=False)           # real Executor.notify_once
+    for _ in range(3):
+        await guarded(svc, "intraday", boom, clock=lambda: now)(None)
+    assert len(svc.notifier.texts) == 1
+    assert caplog.text.count("job intraday failed") == 3
+    assert svc.store.get_state(f"job_error:intraday:RuntimeError:{MON.isoformat()}") is True
+    tomorrow = at(MON.replace(day=3), "10:20")
+    await guarded(svc, "intraday", boom, clock=lambda: tomorrow)(None)
+    assert len(svc.notifier.texts) == 2
+
+
 # ---------------------------------------------------------------- schedule
 
 def test_schedule_jobs_registers_every_job(tmp_path):

@@ -28,6 +28,7 @@ from aitrader.data.news import http_parse
 from aitrader.data.screener import load_universe
 from aitrader.execution import Executor, describe_error
 from aitrader.exits import ExitWatcher
+from aitrader.pipeline_support import notify_once
 from aitrader.risk.limits import LossLimits
 from aitrader.risk.manager import RiskManager
 from aitrader.store import Store
@@ -170,9 +171,10 @@ def guarded(svc: Any, name: str, fn: JobFn, clock: Callable[[], datetime] = now_
             await fn(svc, now)
         except Exception as exc:  # noqa: BLE001 - a job failure must reach the owner, not kill the bot
             where = describe_error(exc)
-            log.error("job %s failed: %s", name, where)
+            log.error("job %s failed: %s", name, where)       # logged every time, alerted once a day
             try:
-                await svc.notifier.send(f"Job {name} failed: {where}. See the log; the next run will try again.")
+                await notify_once(svc, f"job_error:{name}:{type(exc).__name__}:{now.date().isoformat()}",
+                                  f"Job {name} failed: {where}. See the log; the next run will try again.")
             except Exception as send_exc:  # noqa: BLE001
                 log.error("could not tell the owner: %s", describe_error(send_exc))
             return

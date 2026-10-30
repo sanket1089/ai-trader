@@ -49,6 +49,7 @@ from aitrader.pipeline_support import (
     load_model,
     notify,
     pm_context,
+    unacted_ideas,
     usable,
     usd,
 )
@@ -147,6 +148,9 @@ async def premarket(svc: Any, now: datetime) -> None:
     if bench is None and (history is None or len(history) == 0):
         await notify(svc, f"Data feed down: no quote or daily history for {BENCH}. Skipping today's premarket "
                           "AI steps; stop/target exits and loss limits keep running.")
+        with store.transaction():                      # nothing from an earlier day may be reused
+            for key in (SHORTLIST_KEY, PREMARKET_PRICES_KEY, TECHNICALS_KEY, NEWS_DIGEST_KEY, TODAYS_IDEAS_KEY):
+                store.set_state(key, None)
         return
 
     items = await _news_since_last(svc, now)
@@ -225,9 +229,7 @@ async def _trigger(svc: Any, now: datetime, watched: set[str]
 
 async def intraday(svc: Any, now: datetime) -> None:
     store = svc.store
-    expired = svc.approvals.expire_due(now)
-    if expired:
-        await notify(svc, f"{len(expired)} approval card(s) expired unanswered and were not placed.")
+    await _expire_cards(svc, now)
     pending = store.pending_orders()
     await svc.executor.retry_pending(await fetch_quotes(svc, {o.symbol for o in pending}), now)
     await check_limits(svc, now)
@@ -246,6 +248,10 @@ async def intraday(svc: Any, now: datetime) -> None:
     if reason is None:
         return
     store.set_state(LAST_AI_KEY, now.isoformat())
+    # The prices this re-run saw become the new baseline, so one move triggers one re-run.
+    base = dict(store.get_state(PREMARKET_PRICES_KEY) or {})
+    base.update({s: q.price for s, q in quotes.items()})
+    store.set_state(PREMARKET_PRICES_KEY, base)
     if digest is not None:
         store.set_state(NEWS_DIGEST_KEY, digest.model_dump(mode="json"))
     ctx = await pm_context(svc, now, quotes, news=digest or load_model(store, NEWS_DIGEST_KEY, NewsDigest),
@@ -261,11 +267,25 @@ async def intraday(svc: Any, now: datetime) -> None:
 
 # ---------------------------------------------------------------- exits
 
+async def _expire_cards(svc: Any, now: datetime) -> None:
+    expired = svc.approvals.expire_due(now)
+    if expired:
+        await notify(svc, f"{len(expired)} approval card(s) expired unanswered and were not placed.")
+
+
 async def exits_job(svc: Any, now: datetime) -> None:
+    """Stops and targets, limits and card expiry; and, inside the entry window, today's ideas that
+    could not be acted on yet (no fresh quote at 09:20). No AI calls."""
     if not in_window(now, svc.settings.risk.exit_start, MARKET_CLOSE):
         return
     await svc.exits.check(now)
+    await _expire_cards(svc, now)
     await check_limits(svc, now)
+    risk = svc.settings.risk
+    if in_window(now, risk.entry_start, risk.entry_end):
+        waiting = unacted_ideas(svc, _todays_ideas(svc, now))
+        if waiting:
+            await act_on_ideas(svc, waiting, now)
 
 
 # ---------------------------------------------------------------- postmarket

@@ -395,7 +395,7 @@ async def test_intraday_reruns_pm_on_price_trigger_and_sends_new_cards(tmp_path)
     svc = make_svc(tmp_path, md_at(now), llm, now=now)
     svc.store.set_state("premarket_prices", {"NIFTYBEES": 270.0})     # +3.7%
     svc.store.set_state("shortlist", ["NIFTYBEES"])
-    stage_ideas(svc, [nifty_idea(id="old")])
+    stage_ideas(svc, [nifty_idea(id="old", symbol="GOLDBEES", price=100.0)])
     svc.store.set_state("acted_ideas", ["old"])
 
     await pipeline.intraday(svc, now)
@@ -439,11 +439,104 @@ async def test_intraday_reduced_budget_runs_ai_at_most_every_two_hours(tmp_path)
     svc.store.set_state("shortlist", ["NIFTYBEES"])
 
     await pipeline.intraday(svc, now)
+    svc.market_data.prices["NIFTYBEES"] = 290.0                      # a further move after the re-base
     await pipeline.intraday(svc, now + timedelta(hours=1))
     assert sum(c[1] == "PMDecision" for c in llm.calls) == 1
     await pipeline.intraday(svc, now + timedelta(hours=2))
     assert sum(c[1] == "PMDecision" for c in llm.calls) == 2
 
+
+async def test_intraday_rebases_after_a_rerun(tmp_path):
+    now = at(MON, "10:20")
+    llm = full_llm()
+    svc = make_svc(tmp_path, md_at(now), llm, now=now)
+    svc.store.set_state("premarket_prices", {"NIFTYBEES": 271.8})     # +3%
+    svc.store.set_state("shortlist", ["NIFTYBEES"])
+    await pipeline.intraday(svc, now)
+    assert sum(c[1] == "PMDecision" for c in llm.calls) == 1
+    assert svc.store.get_state("premarket_prices")["NIFTYBEES"] == 280.0
+    later = at(MON, "11:20")
+    svc.market_data.ts = later - timedelta(minutes=16)
+    await pipeline.intraday(svc, later)                               # no further move: no re-run
+    assert sum(c[1] == "PMDecision" for c in llm.calls) == 1
+
+
+async def test_intraday_same_symbol_already_acted_today_gets_no_second_card(tmp_path):
+    now = at(MON, "10:20")
+    llm = full_llm()
+    svc = make_svc(tmp_path, md_at(now), llm, now=now)
+    stage_ideas(svc, [nifty_idea(id="first")])
+    await pipeline.open_session(svc, now)
+    assert len(svc.notifier.cards) == 1
+    svc.store.set_state("premarket_prices", {"NIFTYBEES": 270.0})
+    svc.store.set_state("shortlist", ["NIFTYBEES"])
+    await pipeline.intraday(svc, now)                                 # PM proposes NIFTYBEES BUY again
+    assert ("portfolio_manager", "PMDecision") in llm.calls
+    assert len(svc.notifier.cards) == 1
+
+
+# ---------------------------------------------------------------- stale quotes at the open
+
+async def test_stale_open_quotes_leave_ideas_for_exits_job(tmp_path):
+    open_ = at(MON, "09:20")
+    md = FakeMarketData(PRICES, at(MON - timedelta(days=3), "15:29"))     # Friday's last bar
+    svc = make_svc(tmp_path, md, now=open_)
+    set_autopilot(svc.store, True)
+    stage_ideas(svc, [nifty_idea()])
+
+    await pipeline.open_session(svc, open_)
+    assert svc.executor.submits == [] and svc.notifier.cards == []
+    assert svc.store.get_state("acted_ideas") in (None, [])
+
+    fresh = at(MON, "09:41")
+    md.ts = fresh - timedelta(minutes=16)
+    await pipeline.exits_job(svc, fresh)
+    assert {o.book for o, *_ in svc.executor.submits} == {REAL, LEARN}
+    await pipeline.exits_job(svc, fresh + timedelta(minutes=3))
+    assert len(svc.executor.submits) == 2
+    assert svc.store.get_state("acted_ideas") == ["idea1"]
+
+
+async def test_exits_job_does_not_act_outside_entry_window(tmp_path):
+    now = at(MON, "15:20")
+    svc = make_svc(tmp_path, md_at(now), now=now)
+    stage_ideas(svc, [nifty_idea()])
+    await pipeline.exits_job(svc, now)
+    assert svc.notifier.cards == []
+
+
+async def test_exits_job_expires_cards(tmp_path):
+    now = at(MON, "11:00")
+    svc = make_svc(tmp_path, md_at(now), now=now)
+    old = svc.approvals.create(nifty_idea(), {LEARN: 1}, 280.0, now - timedelta(minutes=30))
+    await pipeline.exits_job(svc, now)
+    assert svc.approvals.get(old.id).status == "expired"
+    assert any("expired" in t for t in svc.notifier.texts)
+
+
+async def test_premarket_data_down_clears_yesterdays_state(tmp_path):
+    now = at(MON, "08:30")
+    svc = make_svc(tmp_path, md_at(now, prices={}), full_llm(), now=now)
+    for key in ("shortlist", "premarket_prices", "technicals", "news_digest", "todays_ideas"):
+        svc.store.set_state(key, ["stale"])
+    await pipeline.premarket(svc, now)
+    for key in ("shortlist", "premarket_prices", "technicals", "news_digest", "todays_ideas"):
+        assert svc.store.get_state(key) is None, key
+
+
+async def test_recovery_plan_error_never_aborts_entries(tmp_path):
+    now = at(MON, "09:41")
+    llm = full_llm()
+    llm.responses["RecoveryPlan"] = RuntimeError("api exploded token=secret")
+    svc = make_svc(tmp_path, md_at(now), llm, now=now)
+    svc.store.set_cash(REAL, 400.0)                                    # realistic hard stopped
+    stage_ideas(svc, [nifty_idea()])
+    await pipeline.exits_job(svc, now)
+    await pipeline.exits_job(svc, now + timedelta(minutes=3))
+    assert len(svc.notifier.cards) == 1 and set(svc.notifier.cards[0][0].sizes) == {LEARN}
+    alerts = [t for t in svc.notifier.texts if "recovery plan could not be written" in t]
+    assert len(alerts) == 1 and "secret" not in alerts[0]
+    assert svc.notifier.recoveries == []
 
 # ---------------------------------------------------------------- weekly
 

@@ -82,7 +82,7 @@ py -3 -m venv .venv
 | `/positions` | Holdings and waiting orders per book |
 | `/pnl` | Equity and profit/loss per book, and AI spend this month |
 | `/journal [n]` | The latest lessons the reviewer wrote (default 5, up to 20) |
-| `/pause` | No new entries in any book. Exits and sells still work. |
+| `/pause` | No new entries and no AI sell ideas in any book. Automatic stop/target exits still work. |
 | `/resume` | Lift a pause or stop. A hard-stopped book restarts only after you approve its recovery plan. |
 | `/stop` | Kill switch: cancels waiting entry orders, blocks new ones and turns autopilot off |
 | `/budget` | AI spend this month and today, in US$ and ₹ |
