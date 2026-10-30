@@ -261,8 +261,13 @@ def test_postmarket_saved_equity_and_sent_the_summary_with_lessons(day):
     summary = summaries[0]
     assert f"learning: equity ₹{day.store.cash(LEARN):,.2f}" in summary
     assert f"realistic: equity ₹{day.store.cash(REAL):,.2f}" in summary
-    assert "2 trade(s)" in summary and "AI spend" in summary and "NIFTYBEES benchmark" in summary \
-        or "NIFTYBEES since" in summary or "NIFTYBEES benchmark" in summary
+    for book in (REAL, LEARN):                                      # each book: its trades and charges paid
+        charges = sum(f.charges for f in fills_of(day, book))
+        assert f"{book}: equity" in summary
+        assert f"2 trade(s), charges paid ₹{charges:,.2f}" in summary, summary
+    assert summary.count("2 trade(s)") == 2
+    assert "AI spend (a learning cost, apart from trading P&L): today US$0.00" in summary
+    assert "NIFTYBEES since 2026-11-02:" in summary and "no close today" not in summary
     assert "Lessons added:" in summary and "Entries after the feed catches up" in summary
     assert day.store.recent_lessons(5) == ["Entries after the feed catches up (09:40) still reached the target"]
     assert day.notifier.cards == []                                 # autopilot ON: no approval cards

@@ -3,10 +3,12 @@ no secrets in output) and a full run of ``simulate`` against fakes. The live run
 Anthropic key and is not tested here."""
 
 import importlib.util
+import os
 import shutil
 import time
 from datetime import date, timedelta
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from pipeline_fakes import REPO_CONFIG, SETTINGS, FakeLLM, FakeMarketData, csv_get
@@ -33,6 +35,14 @@ def load_script():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture(autouse=True)
+def isolated_environ():
+    """``main()`` calls ``load_dotenv``, which writes the process environment. Whatever a test (or the
+    script) adds or changes there is undone afterwards, so no key or Telegram value leaks into other tests."""
+    with mock.patch.dict(os.environ):
+        yield
 
 
 @pytest.fixture
@@ -71,10 +81,8 @@ def test_the_key_is_read_from_dotenv_next_to_the_config_and_never_printed(sim, c
         pass
 
     monkeypatch.setattr(sim, "simulate", fake_simulate)
-    try:
-        assert sim.main(["--config", str(config_dir / "config.yaml")]) == 0
-    finally:
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)  # load_dotenv put it in os.environ
+    assert sim.main(["--config", str(config_dir / "config.yaml")]) == 0
+    assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-SECRET-VALUE"      # it came from that .env
     assert "SECRET-VALUE" not in capsys.readouterr().out
 
 
