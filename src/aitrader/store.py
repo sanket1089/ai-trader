@@ -14,6 +14,8 @@ Conventions:
 import json
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -197,6 +199,7 @@ class Store:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._tx_depth = 0          # > 0 while inside transaction(); guarded by _lock
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
@@ -207,11 +210,44 @@ class Store:
         with self._lock:
             self._conn.close()
 
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Group several writes into one atomic commit.
+
+        Outside a transaction every write method commits on its own. Inside the block they
+        don't: everything is committed once when the outermost block exits normally, and rolled
+        back if it exits with an exception, so a crash can never leave a fill saved with its
+        order still PENDING. The block is re-entrant: a nested ``transaction()`` joins the outer
+        one, and an exception leaving any level rolls back the whole outer transaction. The store
+        lock is held for the whole block, so other threads' reads and writes wait for it.
+        """
+        with self._lock:
+            if self._tx_depth > 0:
+                self._tx_depth += 1
+                try:
+                    yield
+                finally:
+                    self._tx_depth -= 1
+                return
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._tx_depth = 1
+            try:
+                yield
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+            finally:
+                self._tx_depth = 0
+
     # ---- helpers ----
 
     def _write(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
-        with self._lock, self._conn:
-            return self._conn.execute(sql, params)
+        with self._lock:
+            if self._tx_depth > 0:          # the enclosing transaction() commits
+                return self._conn.execute(sql, params)
+            with self._conn:
+                return self._conn.execute(sql, params)
 
     def _read(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         with self._lock:

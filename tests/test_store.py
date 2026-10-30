@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -57,13 +58,19 @@ def raw_rows(path, sql):
 
 def test_state_survives_reopen(tmp_path):
     s = Store(tmp_path / "t.db")
-    s.set_state("autopilot", True)
-    s.save_order(order())
-    s.upsert_position(pos())
-    s2 = Store(tmp_path / "t.db")
-    assert s2.get_state("autopilot") is True
-    assert len(s2.pending_orders()) == 1
-    assert s2.positions("learning")[0].symbol == "NIFTYBEES"
+    try:
+        s.set_state("autopilot", True)
+        s.save_order(order())
+        s.upsert_position(pos())
+        s2 = Store(tmp_path / "t.db")
+        try:
+            assert s2.get_state("autopilot") is True
+            assert len(s2.pending_orders()) == 1
+            assert s2.positions("learning")[0].symbol == "NIFTYBEES"
+        finally:
+            s2.close()
+    finally:
+        s.close()
 
 
 def test_uses_wal_journal_mode(tmp_path):
@@ -416,3 +423,127 @@ def test_sell_days_window_is_monday_through_d(store):
     assert store.sell_days_in_week("learning", MON) == 1
     assert store.sell_days_in_week("realistic", TUE) == 1
     assert store.sell_days_in_week("realistic", MON) == 0
+
+
+# ---- transactions: multi-write operations are atomic ----
+
+def _paper_fill_writes(store):
+    """The four writes of one paper fill, which must land together or not at all."""
+    store.save_fill(fill())
+    o = order()
+    o.status = OrderStatus.FILLED
+    store.update_order(o)
+    store.upsert_position(pos())
+    store.set_cash("learning", 99000.0)
+
+
+def _counts(path):
+    """(fills, positions, cash rows, order status) as seen by an independent connection."""
+    return (raw_rows(path, "SELECT COUNT(*) FROM fills")[0][0],
+            raw_rows(path, "SELECT COUNT(*) FROM positions")[0][0],
+            raw_rows(path, "SELECT COUNT(*) FROM cash")[0][0],
+            raw_rows(path, "SELECT status FROM orders")[0][0])
+
+
+def test_transaction_commits_all_writes_on_success(tmp_path):
+    path = tmp_path / "t.db"
+    s = Store(path)
+    try:
+        s.save_order(order())
+        with s.transaction():
+            _paper_fill_writes(s)
+        # A fresh store (separate connection) sees every write.
+        with closing(Store(path)) as fresh:
+            assert len(fresh.fills("learning", at(MON, "00:00"), at(TUE, "00:00"))) == 1
+            assert fresh.pending_orders() == []
+            assert fresh.positions("learning")[0].symbol == "NIFTYBEES"
+            assert fresh.cash("learning") == 99000.0
+    finally:
+        s.close()
+
+
+def test_transaction_rolls_back_all_writes_when_block_raises(tmp_path):
+    path = tmp_path / "t.db"
+    s = Store(path)
+    try:
+        s.save_order(order())
+        with pytest.raises(RuntimeError, match="crash"):
+            with s.transaction():
+                s.save_fill(fill())
+                s.set_cash("learning", 99000.0)
+                raise RuntimeError("crash mid-fill")
+        # Nothing persisted: seen from the same store and from a fresh one.
+        with closing(Store(path)) as fresh:
+            for st in (s, fresh):
+                assert st.fills("learning", at(MON, "00:00"), at(TUE, "00:00")) == []
+                assert not st.has_cash("learning")
+                assert len(st.pending_orders()) == 1      # the order is still PENDING, not half-applied
+    finally:
+        s.close()
+
+
+def test_transaction_defers_commit_until_block_exit(tmp_path):
+    path = tmp_path / "t.db"
+    s = Store(path)
+    try:
+        s.save_order(order())
+        with s.transaction():
+            _paper_fill_writes(s)
+            # Uncommitted: an independent connection still sees the old world...
+            assert _counts(path) == (0, 0, 0, "PENDING")
+            # ...while the writing store reads its own writes.
+            assert s.cash("learning") == 99000.0
+        assert _counts(path) == (1, 1, 1, "FILLED")
+    finally:
+        s.close()
+
+
+def test_nested_transaction_commits_only_at_outermost_exit(tmp_path):
+    path = tmp_path / "t.db"
+    s = Store(path)
+    try:
+        s.save_order(order())
+        with s.transaction():
+            s.save_fill(fill())
+            with s.transaction():
+                s.upsert_position(pos())
+                with s.transaction():
+                    s.set_cash("learning", 99000.0)
+                assert _counts(path) == (0, 0, 0, "PENDING")    # inner exits did not commit
+            assert _counts(path) == (0, 0, 0, "PENDING")
+        assert _counts(path) == (1, 1, 1, "PENDING")
+    finally:
+        s.close()
+
+
+def test_exception_in_nested_transaction_rolls_back_the_whole_outer_block(tmp_path):
+    path = tmp_path / "t.db"
+    s = Store(path)
+    try:
+        with pytest.raises(ValueError):
+            with s.transaction():
+                s.save_fill(fill())
+                with s.transaction():
+                    s.set_cash("learning", 99000.0)
+                    raise ValueError("inner failure")
+        assert raw_rows(path, "SELECT COUNT(*) FROM fills") == [(0,)]
+        assert raw_rows(path, "SELECT COUNT(*) FROM cash") == [(0,)]
+    finally:
+        s.close()
+
+
+def test_store_commits_per_call_again_after_a_rolled_back_transaction(tmp_path):
+    path = tmp_path / "t.db"
+    s = Store(path)
+    try:
+        with pytest.raises(RuntimeError):
+            with s.transaction():
+                s.set_cash("learning", 1.0)
+                raise RuntimeError
+        s.set_cash("realistic", 1000.0)                  # outside any transaction again
+        assert raw_rows(path, "SELECT book, value FROM cash") == [("realistic", 1000.0)]
+        with s.transaction():                            # and a new transaction works
+            s.set_cash("learning", 5.0)
+        assert raw_rows(path, "SELECT COUNT(*) FROM cash") == [(2,)]
+    finally:
+        s.close()
