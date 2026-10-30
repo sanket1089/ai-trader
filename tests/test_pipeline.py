@@ -21,7 +21,7 @@ from aitrader.agents.schemas import (
 from aitrader.approvals import get_autopilot, set_autopilot
 from aitrader.calendar import at
 from aitrader.charges import compute_charges
-from aitrader.models import Fill, Position, Side, TradeIdea
+from aitrader.models import Fill, Order, Position, Side, TradeIdea
 from aitrader.risk.limits import LimitState
 from aitrader.risk.manager import MANUAL_STOP_KEY, PAUSED_KEY
 
@@ -82,6 +82,28 @@ async def test_premarket_data_down_alerts_and_skips_ai(tmp_path):
     assert any("data feed down" in t.lower() for t in svc.notifier.texts)
     assert llm.calls == []
     assert svc.store.get_state("todays_ideas") is None
+
+
+async def test_premarket_quote_missing_but_history_ok_runs_ai(tmp_path):
+    now = at(MON, "08:30")
+    llm = full_llm()
+    md = md_at(now)
+    md.quotes = lambda symbols: {}                    # no intraday quote before the open
+    svc = make_svc(tmp_path, md, llm, now=now)
+    await pipeline.premarket(svc, now)
+    assert not any("data feed down" in t.lower() for t in svc.notifier.texts)
+    assert ("technical", "TechnicalBatch") in llm.calls
+    assert len(svc.store.get_state("todays_ideas")) == 1      # PM priced off the last daily close
+
+
+async def test_premarket_both_quote_and_history_missing_alerts(tmp_path):
+    now = at(MON, "08:30")
+    llm = full_llm()
+    svc = make_svc(tmp_path, md_at(now, history=False), llm, now=now)
+    svc.market_data.quotes = lambda symbols: {}
+    await pipeline.premarket(svc, now)
+    assert any("data feed down" in t.lower() for t in svc.notifier.texts)
+    assert llm.calls == []
 
 
 async def test_premarket_stores_todays_ideas(tmp_path):
@@ -160,6 +182,53 @@ async def test_open_session_ignores_ideas_from_an_earlier_day(tmp_path):
     stage_ideas(svc, [nifty_idea()], day=MON - timedelta(days=3))
     await pipeline.open_session(svc, now)
     assert svc.notifier.cards == []
+
+
+async def test_open_session_reanchors_buy_limit_to_fresh_quote(tmp_path):
+    now = at(MON, "09:20")
+    svc = make_svc(tmp_path, md_at(now, prices={**PRICES, "NIFTYBEES": 284.0}), now=now, spy=False)
+    idea = TradeIdea(id="i1", symbol="NIFTYBEES", side=Side.BUY, limit_price=280.0, stop=266.0, target=300.0,
+                     expected_move_pct=7.0, confidence=0.7, holding_days=5, reason="breakout")
+    stage_ideas(svc, [idea])
+    await pipeline.open_session(svc, now)
+
+    stored = svc.store.get_idea("i1")
+    assert stored.limit_price == 284.0 and stored.stop == 266.0 and stored.target == 300.0
+    assert stored.expected_move_pct == pytest.approx((300.0 - 284.0) / 284.0 * 100)
+    card, text = svc.notifier.cards[0]
+    assert "₹284.00" in text
+    quote = svc.market_data.quote("NIFTYBEES")
+    order = Order(id="o", book=LEARN, symbol="NIFTYBEES", side=Side.BUY, qty=card.sizes[LEARN],
+                  limit_price=stored.limit_price, reason="r", is_exit=False, idea_id="i1", created_at=now)
+    decision = svc.risk.check(order, quote, now, stored)
+    assert not any("outside" in r for r in decision.reasons), decision.reasons
+    assert decision.approved, decision.reasons
+
+
+async def test_open_session_skips_idea_already_beyond_target(tmp_path):
+    now = at(MON, "09:20")
+    svc = make_svc(tmp_path, md_at(now, prices={**PRICES, "NIFTYBEES": 305.0}), now=now)
+    set_autopilot(svc.store, True)
+    stage_ideas(svc, [nifty_idea()])                       # target 302.4
+    await pipeline.open_session(svc, now)
+    assert svc.executor.submits == [] and svc.notifier.cards == []
+    assert svc.store.get_idea("idea1").limit_price == 280.0
+
+
+async def test_open_session_sell_idea_reanchored_only_when_held(tmp_path):
+    now = at(MON, "09:20")
+    svc = make_svc(tmp_path, md_at(now, prices={**PRICES, "GOLDBEES": 101.234}), now=now)
+    sell = TradeIdea(id="s1", symbol="GOLDBEES", side=Side.SELL, limit_price=100.0, stop=100.0, target=100.0,
+                     expected_move_pct=0.0, confidence=0.6, holding_days=1, reason="exit early")
+    stage_ideas(svc, [sell])
+    await pipeline.open_session(svc, now)
+    assert svc.notifier.cards == []                        # not held: skipped
+
+    svc.store.upsert_position(Position(LEARN, "GOLDBEES", 5, 95.0, 90.0, 120.0, now))
+    svc.store.set_state("acted_ideas", [])
+    await pipeline.open_session(svc, now)
+    assert svc.store.get_idea("s1").limit_price == 101.23
+    assert svc.notifier.cards[0][0].sizes == {LEARN: 5}
 
 
 async def test_realistic_book_skipped_when_unaffordable(tmp_path):

@@ -17,6 +17,7 @@ import logging
 import math
 import uuid
 from collections.abc import Iterable
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -261,6 +262,35 @@ def _sizes(svc: Any, idea: TradeIdea, evals: dict[str, LimitEval], quotes: dict[
     return sizes
 
 
+def reanchor(svc: Any, idea: TradeIdea, quote: Quote) -> TradeIdea | None:
+    """The idea re-priced at the fresh quote, saved under the same id, or ``None`` to skip it.
+
+    Premarket limits are set against the previous close and may be outside the entry band by the
+    time the idea is acted on. BUY: limit = the quote (to the paisa), stop and target kept, and
+    ``stop < limit < target`` must still hold; ``expected_move_pct`` is capped at the new
+    limit-to-target distance. SELL: limit = the quote, only for a symbol some book holds. The
+    adjusted idea is persisted so the card, the risk cost rule and the review all see one version.
+    """
+    limit = round(quote.price, 2)
+    if idea.side is Side.BUY:
+        if not idea.stop < limit < idea.target:
+            log.info("%s: price already beyond stop/target at open (price %.2f, stop %.2f, target %.2f); "
+                     "idea skipped", idea.symbol, limit, idea.stop, idea.target)
+            return None
+        move = min(idea.expected_move_pct, (idea.target - limit) / limit * 100)
+        adjusted = replace(idea, limit_price=limit, expected_move_pct=move)
+    elif idea.side is Side.SELL:
+        if idea.symbol not in held_symbols(svc):
+            log.info("%s: SELL idea skipped, the symbol is not held", idea.symbol)
+            return None
+        adjusted = replace(idea, limit_price=limit)
+    else:
+        return None
+    if adjusted != idea:
+        svc.store.save_idea(adjusted)                     # INSERT OR REPLACE: same id, new values
+    return adjusted
+
+
 def entries_blocked(svc: Any) -> bool:
     return bool(svc.store.get_state(PAUSED_KEY)) or bool(svc.store.get_state(MANUAL_STOP_KEY))
 
@@ -290,6 +320,9 @@ async def _act_on_ideas(svc: Any, ideas: list[TradeIdea], now: datetime) -> None
         quote = (await fetch_quotes(svc, [idea.symbol])).get(idea.symbol)
         if quote is None:
             await notify(svc, f"Skipped {idea.side} {idea.symbol}: no current price.")
+            continue
+        idea = reanchor(svc, idea, quote)
+        if idea is None:
             continue
         sizes = _sizes(svc, idea, evals, {**held_quotes, idea.symbol: quote}, now)
         if not sizes:

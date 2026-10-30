@@ -143,7 +143,8 @@ async def premarket(svc: Any, now: datetime) -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("daily history for %s failed: %s", BENCH, describe_error(exc))
         history = None
-    if bench is None or history is None or len(history) == 0:
+    # Either source is enough: before the open the 5-minute quote feed is often empty.
+    if bench is None and (history is None or len(history) == 0):
         await notify(svc, f"Data feed down: no quote or daily history for {BENCH}. Skipping today's premarket "
                           "AI steps; stop/target exits and loss limits keep running.")
         return
@@ -154,6 +155,9 @@ async def premarket(svc: Any, now: datetime) -> None:
     held = held_symbols(svc)
     shortlist = _shortlist(svc, snaps, count_hits(relevant, svc.aliases), held)
     quotes = await fetch_quotes(svc, set(shortlist) | held | {BENCH})
+    for symbol in set(shortlist) | held:              # before the open: fall back to the last daily close
+        if symbol not in quotes and symbol in snaps:
+            quotes[symbol] = Quote(symbol, snaps[symbol].close, now)
 
     with store.transaction():
         store.set_state(SHORTLIST_KEY, shortlist)
