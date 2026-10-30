@@ -20,7 +20,9 @@ A position with no stop gets one owner alert (state key ``nostop_alerted:<book>:
 A position with no quote, or only a stale or unusable one, is skipped with a warning: the risk gate
 refuses a stale quote anyway, so trying would only fill the log and the owner's chat with
 rejections. Its stop-loss cannot be checked, so the owner is told once per IST day (state key
-``noquote_alerted:<book>:<symbol>:<date>``).
+``noquote_alerted:<book>:<symbol>:<date>``), but not before ``exit_start`` + ``data_delay_minutes`` +
+``stale_extra_minutes`` (09:40 IST with the current config): until then the delayed feed has not
+caught up with the open and the skip is only logged at INFO.
 
 One position that raises (a broker or risk error) is logged by error type, place, book and symbol
 (never the message), the owner is told once per IST day (``check_error_alerted:<book>:<symbol>:<date>``)
@@ -35,7 +37,7 @@ import math
 import uuid
 from datetime import datetime, timedelta
 
-from aitrader.calendar import IST, in_window
+from aitrader.calendar import IST, at, in_window
 from aitrader.config import RiskConfig
 from aitrader.data.market_data import MarketData, is_stale
 from aitrader.execution import Executor, describe_error
@@ -114,16 +116,32 @@ class ExitWatcher:
         await self._alert_if_no_stop(position)
 
         if quote is None:
-            log.warning("no quote for %s %s; skipping its exit check", book, symbol)
+            problem = "no quote"
         elif not (math.isfinite(quote.price) and quote.price > 0):
-            log.warning("unusable price %r for %s %s; skipping its exit check", quote.price, book, symbol)
+            problem = f"unusable price {quote.price!r}"
         elif is_stale(quote, now, self._cfg):
-            log.warning("quote for %s %s is stale (%s); skipping its exit check", book, symbol, quote.ts)
+            problem = f"stale quote ({quote.ts})"
         else:
             return await self._act_on_price(position, quote, now)
-        await self._executor.notify_once(f"noquote_alerted:{book}:{symbol}:{_day(now)}",
-                                         f"no fresh price for {symbol}; its stop-loss can't be checked")
+
+        # No fresh price: the stop-loss cannot be checked. Right after the open that is normal (the
+        # feed is delayed), so it is only logged until the first fresh quote could have arrived.
+        if now < self._blind_alert_from(now):
+            log.info("%s for %s %s; skipping its exit check (feed still catching up after the open)",
+                     problem, book, symbol)
+            return None
+        log.warning("%s for %s %s; skipping its exit check", problem, book, symbol)
+        await self._executor.notify_once(
+            f"noquote_alerted:{book}:{symbol}:{_day(now)}",
+            f"{book}: no fresh price for {symbol}; its stop-loss can't be checked")
         return None
+
+    def _blind_alert_from(self, now: datetime) -> datetime:
+        """Today's moment from which a missing or stale quote is alerted: ``exit_start`` plus the feed
+        delay plus the staleness allowance (09:15 + 15 + 10 = 09:40 with the current config)."""
+        cfg = self._cfg
+        return at(now.astimezone(IST).date(), cfg.exit_start) + timedelta(
+            minutes=cfg.data_delay_minutes + cfg.stale_extra_minutes)
 
     async def _act_on_price(self, position: Position, quote: Quote, now: datetime) -> Fill | None:
         book, symbol = position.book, position.symbol

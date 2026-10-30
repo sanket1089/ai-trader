@@ -460,7 +460,7 @@ async def test_unusable_price_is_skipped(rig):
     assert order_ids(rig.db_path) == []
 
 
-BLIND = f"no fresh price for {SYMBOL}; its stop-loss can't be checked"
+BLIND = f"{BOOK}: no fresh price for {SYMBOL}; its stop-loss can't be checked"
 
 
 def blind_alerts(rig):
@@ -490,6 +490,55 @@ async def test_blind_stop_alerts_the_owner_once_per_day(rig, kind):
     await rig.watcher.check(tomorrow)                        # a new day: told again
     assert blind_alerts(rig) == [BLIND, BLIND]
     assert rig.store.get_state(f"noquote_alerted:{BOOK}:{SYMBOL}:{MON.isoformat()}") is True
+
+
+def yesterdays_close(rig):
+    """What the delayed feed still shows right after the open: the last bar of the previous session."""
+    rig.md.set(SYMBOL, 280.0, at(date(2026, 10, 30), "15:29"))
+
+
+@pytest.mark.parametrize("kind", ["missing", "stale"])
+async def test_no_blind_stop_alert_until_the_feed_could_have_caught_up(rig, kind, caplog):
+    hold(rig.store)
+    if kind == "stale":
+        yesterdays_close(rig)
+
+    with caplog.at_level(logging.INFO, logger="aitrader.exits"):
+        await rig.watcher.check(at(MON, "09:20"))
+        await rig.watcher.check(at(MON, "09:39"))
+    assert blind_alerts(rig) == []                           # still within 09:15 + 15 + 10 minutes
+    ours = [r for r in caplog.records if r.name == "aitrader.exits" and SYMBOL in r.getMessage()]
+    assert ours and all(r.levelno == logging.INFO for r in ours)     # only logged, and not as a warning
+
+    await rig.watcher.check(at(MON, "09:41"))                # the feed should have caught up by now
+    assert blind_alerts(rig) == [BLIND]
+    await rig.watcher.check(at(MON, "09:44"))
+    assert blind_alerts(rig) == [BLIND]                      # and still once per day
+
+
+@pytest.mark.parametrize("hhmm, alerts", [("09:39", 0), ("09:40", 1)])
+async def test_blind_stop_alert_starts_at_exit_start_plus_feed_delay_plus_allowance(rig, hhmm, alerts):
+    hold(rig.store)
+    await rig.watcher.check(at(MON, hhmm))
+    assert len(blind_alerts(rig)) == alerts
+
+
+async def test_blind_stop_grace_is_computed_from_the_risk_config(rig):
+    cfg = RISK_CFG.model_copy(update={"data_delay_minutes": 5, "stale_extra_minutes": 5})   # 09:15 + 10
+    watcher = ExitWatcher(rig.store, rig.executor, rig.md, cfg, [BOOK])
+    hold(rig.store)
+
+    await watcher.check(at(MON, "09:24"))
+    assert blind_alerts(rig) == []
+    await watcher.check(at(MON, "09:25"))
+    assert blind_alerts(rig) == [BLIND]
+
+
+async def test_a_fresh_stop_hit_is_still_acted_on_before_the_grace_period_ends(rig):
+    hold(rig.store, stop=270.0)
+    open_ = at(MON, "09:20")
+    price(rig, 250.0, open_)
+    assert len(await rig.watcher.check(open_)) == 1
 
 
 async def test_no_blind_stop_alert_while_the_price_is_fresh(rig):
