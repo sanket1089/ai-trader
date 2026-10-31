@@ -17,6 +17,7 @@ dependencies = [
     "feedparser",
     "httpx",
     "tzdata",
+    "truststore",         # use the OS certificate store, so HTTPS works behind a TLS-inspecting corporate proxy
     "python-telegram-bot[job-queue]>=21",
 ]
 

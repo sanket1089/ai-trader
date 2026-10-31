@@ -12,6 +12,7 @@ import os
 import sys
 from pathlib import Path
 
+import truststore
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
@@ -118,6 +119,7 @@ def run(config_path: Path, dry_run: bool) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    truststore.inject_into_ssl()                      # trust the OS store (corporate proxy CA) before any HTTPS
     for stream in (sys.stdout, sys.stderr):           # ₹ on a Windows console
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
